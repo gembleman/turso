@@ -1492,3 +1492,66 @@ test pg-dump-descending-index-keys {
 expect {
     CREATE INDEX idx ON public.indexed USING btree (first DESC, second, third DESC)
 }
+
+# A relation's oid is stable: it comes from a stored catalog row, not from
+# the relation's position among sorted names. Raw oid values differ between
+# engines, so the tests compare through joins.
+
+test pg-class-oid-survives-creating-and-dropping-an-earlier-table {
+    CREATE TABLE zz_stable (x int);
+    CREATE TABLE zz_oid_memo (memo oid);
+    INSERT INTO zz_oid_memo SELECT oid FROM pg_class WHERE relname = 'zz_stable';
+    CREATE TABLE aa_sorts_first (x int);
+    DROP TABLE aa_sorts_first;
+    SELECT count(*) FROM pg_class c JOIN zz_oid_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_stable';
+}
+expect {
+    1
+}
+
+test pg-attribute-joins-to-pg-class-after-a-drop {
+    CREATE TABLE zz_attrs (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE aa_dropped (x int);
+    DROP TABLE aa_dropped;
+    SELECT a.attname FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid
+    WHERE c.relname = 'zz_attrs' AND a.attnum > 0 ORDER BY a.attnum;
+}
+expect {
+    id
+    v
+}
+
+test pg-index-joins-to-pg-class-after-a-drop {
+    CREATE TABLE zz_indexed (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE aa_dropped2 (x int);
+    DROP TABLE aa_dropped2;
+    SELECT count(*) FROM pg_index i JOIN pg_class c ON i.indrelid = c.oid
+    WHERE c.relname = 'zz_indexed';
+}
+expect {
+    2
+}
+
+test pg-constraint-joins-to-pg-class-after-a-drop {
+    CREATE TABLE zz_constrained (id int PRIMARY KEY, v text UNIQUE);
+    CREATE TABLE aa_dropped3 (x int);
+    DROP TABLE aa_dropped3;
+    SELECT count(*) FROM pg_constraint con JOIN pg_class c ON con.conrelid = c.oid
+    WHERE c.relname = 'zz_constrained' AND con.contype IN ('p', 'u');
+}
+expect {
+    2
+}
+
+test rename-keeps-the-oid {
+    CREATE TABLE zz_before_rename (x int);
+    CREATE TABLE zz_rename_memo (memo oid);
+    INSERT INTO zz_rename_memo SELECT oid FROM pg_class WHERE relname = 'zz_before_rename';
+    ALTER TABLE zz_before_rename RENAME TO zz_after_rename;
+    SELECT count(*) FROM pg_class c JOIN zz_rename_memo m ON c.oid = m.memo
+    WHERE c.relname = 'zz_after_rename';
+}
+expect {
+    1
+}

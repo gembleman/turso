@@ -91,15 +91,20 @@ pub fn open_database_with_io(
     }
     let file = io.open_file(path, flags, true)?;
     let db_file = Arc::new(turso_core::storage::database::DatabaseFile::new(file));
-    turso_core::Database::open(
+    let db = turso_core::Database::open(
         io,
         path,
         turso_core::OpenOptions::new(Arc::new(PostgresDialect))
             .storage(db_file)
             .flags(flags)
             .db_opts(opts.with_mvcc(true)),
-    )
-    .map_err(Into::into)
+    )?;
+    // After the open, the classes table exists before the database holds
+    // any relation, and every relation gets its row from its CREATE. A
+    // database with relations but no catalog is from an earlier tursopg and
+    // is refused.
+    crate::classes::ensure_classes_table(&db, flags.contains(turso_core::OpenFlags::ReadOnly))?;
+    Ok(db)
 }
 
 /// Refuses an existing file whose tables are in no schema before it is
