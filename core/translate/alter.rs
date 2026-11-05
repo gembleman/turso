@@ -824,6 +824,16 @@ pub fn translate_alter_table(
         name: qualified_name,
         body: alter_table,
     } = alter;
+    if let ast::AlterTableBody::OwnerTo { role, if_exists } = &alter_table {
+        return translate_alter_owner(
+            &qualified_name,
+            role,
+            *if_exists,
+            resolver,
+            program,
+            connection,
+        );
+    }
     let namespace = resolver.resolve_existing_table(&qualified_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
@@ -887,6 +897,9 @@ pub fn translate_alter_table(
     let mut btree = (*original_btree).clone();
 
     match alter_table {
+        ast::AlterTableBody::OwnerTo { .. } => {
+            unreachable!("OWNER TO is translated before the table is resolved")
+        }
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
 
@@ -2441,6 +2454,81 @@ pub fn translate_alter_table(
     Ok(())
 }
 
+/// Translates `ALTER TABLE name OWNER TO role`, and the same for the other
+/// relation kinds: the dialect records the new owner in its own schema
+/// state. Only a superuser may run it for now — PostgreSQL also lets the
+/// current owner transfer ownership when it is a member of the new role,
+/// which is a later task — so
+/// [`crate::translate::roles::check_statement_privileges`] denies it to
+/// everyone else before translation.
+fn translate_alter_owner(
+    qualified_name: &ast::QualifiedName,
+    role: &ast::RoleSpec,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let normalized_name = normalize_ident(qualified_name.name.as_str());
+    let Some(namespace) = owned_relation_namespace(resolver, qualified_name, &normalized_name)
+    else {
+        if if_exists {
+            return Ok(());
+        }
+        crate::bail_parse_error!("relation \"{normalized_name}\" does not exist");
+    };
+    if namespace.database_id != crate::MAIN_DB_ID {
+        crate::bail_parse_error!("permission denied: \"{normalized_name}\" is a system catalog");
+    }
+
+    let schema_cookie = resolver.with_schema(crate::MAIN_DB_ID, |s| s.schema_version);
+    program.begin_write_on_database(crate::MAIN_DB_ID, schema_cookie)?;
+    resolver.catalog.dialect.emit_relation_owner_change(
+        program,
+        resolver.schema(),
+        connection,
+        namespace.id,
+        &normalized_name,
+        role,
+    )?;
+    crate::translate::schema::emit_schema_cookie(resolver, program);
+    Ok(())
+}
+
+/// The namespace of the relation `qualified_name` names: a table, view,
+/// materialized view, sequence or index, whichever exists. None when none
+/// does.
+fn owned_relation_namespace(
+    resolver: &Resolver,
+    qualified_name: &ast::QualifiedName,
+    normalized_name: &str,
+) -> Option<NamespaceRef> {
+    let relation_exists = |namespace: NamespaceRef| {
+        resolver.with_schema(namespace.database_id, |schema| {
+            schema.get_table(namespace.id, normalized_name).is_some()
+                || schema.get_view(namespace.id, normalized_name).is_some()
+                || schema.is_materialized_view(namespace.id, normalized_name)
+                || schema.get_sequence(namespace.id, normalized_name).is_some()
+                || schema
+                    .indexes(namespace.id)
+                    .any(|index| index.name.eq_ignore_ascii_case(normalized_name))
+        })
+    };
+    if qualified_name.namespace.is_some() {
+        return resolver
+            .resolve_namespace(qualified_name)
+            .ok()
+            .filter(|namespace| relation_exists(*namespace));
+    }
+    resolver
+        .find_existing_table(qualified_name)
+        .ok()
+        .flatten()
+        .or_else(|| resolver.find_existing_index(qualified_name).ok().flatten())
+        .or_else(|| resolver.find_existing_sequence(normalized_name))
+        .filter(|namespace| relation_exists(*namespace))
+}
+
 /// Adds the FOREIGN KEY of an inline `REFERENCES` clause on column
 /// `column_name` to `table`. `constraint` must be a
 /// [ast::ColumnConstraint::ForeignKey].
@@ -2497,6 +2585,8 @@ fn reject_alter_of_view(
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
         }
+        // OWNER TO works on views; it is translated before this check runs.
+        ast::AlterTableBody::OwnerTo { .. } => Ok(()),
     }
 }
 

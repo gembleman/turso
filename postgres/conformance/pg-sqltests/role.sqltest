@@ -587,3 +587,148 @@ expect {
     readable
     readable
 }
+
+# Relation ownership: pg_class.relowner stores the owning role, ALTER ...
+# OWNER TO changes it, and the owner may drop and alter the relation.
+
+test relowner-is-the-creating-role {
+    CREATE TABLE ro_created (x int);
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_created';
+}
+expect {
+    postgres
+}
+
+test owner-to-stores-the-owner-for-pg-get-userbyid {
+    CREATE ROLE ro_alice;
+    CREATE TABLE ro_owned (x int);
+    ALTER TABLE ro_owned OWNER TO ro_alice;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_owned';
+}
+expect {
+    ro_alice
+}
+
+test owner-may-drop-the-table {
+    CREATE ROLE ro_dropper;
+    CREATE TABLE ro_to_drop (x int);
+    ALTER TABLE ro_to_drop OWNER TO ro_dropper;
+    SET ROLE ro_dropper;
+    DROP TABLE ro_to_drop;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class WHERE relname = 'ro_to_drop';
+}
+expect {
+    0
+}
+
+# PostgreSQL also demands CREATE on the schema to rename, which Turso does
+# not have yet, so the rename runs as the superuser here; the owner-driven
+# rename is covered by the Rust integration tests.
+test rename-keeps-the-owner {
+    CREATE ROLE ro_renamer;
+    CREATE TABLE ro_to_rename (x int);
+    ALTER TABLE ro_to_rename OWNER TO ro_renamer;
+    ALTER TABLE ro_to_rename RENAME TO ro_renamed;
+    SELECT pg_get_userbyid(relowner) FROM pg_class WHERE relname = 'ro_renamed';
+}
+expect {
+    ro_renamer
+}
+
+test non-owner-may-not-drop-the-table {
+    CREATE ROLE ro_owner1;
+    CREATE ROLE ro_other1;
+    CREATE TABLE ro_guarded (x int);
+    ALTER TABLE ro_guarded OWNER TO ro_owner1;
+    SET ROLE ro_other1;
+    DROP TABLE ro_guarded;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ro_guarded
+}
+
+test non-owner-may-not-alter-the-table {
+    CREATE ROLE ro_owner2;
+    CREATE ROLE ro_other2;
+    CREATE TABLE ro_guarded2 (x int);
+    ALTER TABLE ro_guarded2 OWNER TO ro_owner2;
+    SET ROLE ro_other2;
+    ALTER TABLE ro_guarded2 RENAME TO ro_stolen;
+}
+@sqlstate 42501
+expect error {
+    must be owner of table ro_guarded2
+}
+
+test owner-may-not-transfer-ownership-yet {
+    CREATE ROLE ro_owner3;
+    CREATE ROLE ro_other3;
+    CREATE TABLE ro_guarded3 (x int);
+    ALTER TABLE ro_guarded3 OWNER TO ro_owner3;
+    SET ROLE ro_owner3;
+    ALTER TABLE ro_guarded3 OWNER TO ro_other3;
+}
+@sqlstate 42501
+expect error {}
+
+test owner-to-a-missing-role-fails {
+    CREATE TABLE ro_no_role (x int);
+    ALTER TABLE ro_no_role OWNER TO ro_missing_role;
+}
+@sqlstate 42704
+expect error {
+    role "ro_missing_role" does not exist
+}
+
+test owner-to-on-a-missing-table-fails {
+    ALTER TABLE ro_missing_table OWNER TO postgres;
+}
+@sqlstate 42P01
+expect error {
+    relation "ro_missing_table" does not exist
+}
+
+test owner-to-if-exists-tolerates-a-missing-table {
+    ALTER TABLE IF EXISTS ro_missing_table2 OWNER TO postgres;
+    SELECT 1;
+}
+expect {
+    1
+}
+
+# PostgreSQL accepts ALTER INDEX ... OWNER TO but keeps the index owned by
+# its table's owner, so the count checks only the sequence.
+test owner-to-works-on-views-and-sequences {
+    CREATE ROLE ro_kinds;
+    CREATE TABLE ro_base (x int);
+    CREATE VIEW ro_view AS SELECT x FROM ro_base;
+    CREATE SEQUENCE ro_seq;
+    CREATE INDEX ro_idx ON ro_base (x);
+    ALTER VIEW ro_view OWNER TO ro_kinds;
+    ALTER SEQUENCE ro_seq OWNER TO ro_kinds;
+    ALTER INDEX ro_idx OWNER TO ro_kinds;
+    SET ROLE ro_kinds;
+    DROP VIEW ro_view;
+    SET ROLE postgres;
+    SELECT count(*) FROM pg_class WHERE relname = 'ro_seq'
+    AND pg_get_userbyid(relowner) = 'ro_kinds';
+}
+expect {
+    1
+}
+
+test pg-tables-and-pg-sequences-report-the-owner {
+    CREATE ROLE ro_reporter;
+    CREATE TABLE ro_reported (x int);
+    CREATE SEQUENCE ro_reported_seq;
+    ALTER TABLE ro_reported OWNER TO ro_reporter;
+    ALTER SEQUENCE ro_reported_seq OWNER TO ro_reporter;
+    SELECT tableowner FROM pg_tables WHERE tablename = 'ro_reported';
+    SELECT sequenceowner FROM pg_sequences WHERE sequencename = 'ro_reported_seq';
+}
+expect {
+    ro_reporter
+    ro_reporter
+}

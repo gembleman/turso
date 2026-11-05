@@ -49,6 +49,11 @@ pub enum RelationChange {
         new_namespace: crate::namespace::NamespaceId,
         new_name: String,
     },
+    OwnerChanged {
+        namespace: crate::namespace::NamespaceId,
+        name: String,
+        owner: crate::security::roles::RoleId,
+    },
 }
 
 pub trait Dialect: Send + Sync + 'static {
@@ -302,6 +307,24 @@ pub trait Dialect: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Emits the bytecode of `ALTER ... OWNER TO`: records `new_owner` as
+    /// the owner of relation `name` of `namespace` in the dialect's own
+    /// schema state. A dialect without ownership refuses the statement.
+    fn emit_relation_owner_change(
+        &self,
+        program: &mut crate::vdbe::builder::ProgramBuilder,
+        schema: &crate::schema::Schema,
+        connection: &std::sync::Arc<crate::Connection>,
+        namespace: crate::namespace::NamespaceId,
+        name: &str,
+        new_owner: &turso_parser::ast::RoleSpec,
+    ) -> crate::Result<()> {
+        let _ = (program, schema, connection, namespace, name, new_owner);
+        Err(crate::LimboError::ParseError(
+            "ALTER ... OWNER TO is not supported".to_string(),
+        ))
+    }
+
     /// Applies `change` to the dialect's schema state in `schema` while the
     /// statement that wrote it runs, so the in-memory copy follows the
     /// stored rows. `new_id` carries the id the dialect's state gave a
@@ -322,6 +345,19 @@ pub trait Dialect: Send + Sync + 'static {
     /// made while it was attached could not be opened later.
     fn supports_relation_ddl_in_attached_databases(&self) -> bool {
         true
+    }
+
+    /// The role that owns relation `name` of `namespace`, when the dialect
+    /// stores ownership. None means ownership is unknown, and only a
+    /// superuser may drop or alter the relation.
+    fn relation_owner(
+        &self,
+        schema: &crate::schema::Schema,
+        namespace: crate::namespace::NamespaceId,
+        name: &str,
+    ) -> Option<crate::security::roles::RoleId> {
+        let _ = (schema, namespace, name);
+        None
     }
 
     /// The namespaces of a database that has never created or dropped one.

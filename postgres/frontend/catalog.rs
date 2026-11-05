@@ -256,6 +256,20 @@ impl Dialect for PostgresDialect {
         crate::classes::emit_relations_renamed(program, schema, namespace, renames)
     }
 
+    fn emit_relation_owner_change(
+        &self,
+        program: &mut turso_core::ProgramBuilder,
+        schema: &Schema,
+        connection: &Arc<Connection>,
+        namespace: NamespaceId,
+        name: &str,
+        new_owner: &turso_parser::ast::RoleSpec,
+    ) -> turso_core::Result<()> {
+        crate::classes::emit_relation_owner_change(
+            program, schema, connection, namespace, name, new_owner,
+        )
+    }
+
     fn apply_relation_change(
         &self,
         schema: &mut Schema,
@@ -263,6 +277,15 @@ impl Dialect for PostgresDialect {
         new_id: Option<i64>,
     ) -> turso_core::Result<()> {
         crate::classes::apply_relation_change(schema, change, new_id)
+    }
+
+    fn relation_owner(
+        &self,
+        schema: &Schema,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> Option<RoleId> {
+        crate::classes::relation_owner(schema, namespace, name)
     }
 
     fn supports_roles(&self) -> bool {

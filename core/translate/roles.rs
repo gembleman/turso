@@ -10,7 +10,9 @@
 //! may not write to any table, use a sequence or change the schema. It may
 //! read tables, which row-level security limits, and switch roles.
 
-use crate::namespace::NamespaceId;
+use crate::namespace::{NamespaceId, NamespaceRef};
+use crate::sync::Arc;
+use crate::Connection;
 use turso_parser::ast;
 
 use crate::security::permission::{Action, Object, PermissionDenied};
@@ -25,11 +27,17 @@ use crate::{bail_parse_error, LimboError, Result, MAIN_DB_ID};
 
 const MAIN_SCHEMA_NAME: &str = "main";
 
-/// Fails if a role that is not a superuser may not run `stmt` at all. Uses of
+/// Fails if a role that is not a superuser may not run `stmt` at all. The
+/// owner of a relation may drop and alter it; everything else needs a
+/// superuser. Uses of
 /// sequences and PRAGMAs inside the statement are checked when they are
 /// compiled, by [check_sequence_change] and [check_pragma_function], so that
 /// the views a query reads are checked too.
-pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
+pub fn check_statement_privileges(
+    stmt: &ast::Stmt,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
     let denial = match stmt {
         ast::Stmt::Select(_) => return Ok(()),
         ast::Stmt::Insert { tbl_name, .. } | ast::Stmt::Delete { tbl_name, .. } => {
@@ -64,29 +72,59 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
                 Object::Schema(MAIN_SCHEMA_NAME.to_string()),
             )
         }
+        // PostgreSQL lets the table's owner index it.
         ast::Stmt::CreateIndex { tbl_name, .. } => {
+            let qualified = ast::QualifiedName::single(tbl_name.clone());
+            if may_act_as_owner_of_table(resolver, connection, &qualified) {
+                return Ok(());
+            }
             PermissionDenied::owner(Action::Alter, Object::Table(tbl_name.as_str().to_string()))
         }
         ast::Stmt::CreateTrigger { tbl_name, .. } => PermissionDenied::privilege(
             Action::CreateTrigger,
             Object::Table(tbl_name.name.as_str().to_string()),
         ),
-        ast::Stmt::AlterTable(alter) => PermissionDenied::owner(
-            Action::Alter,
-            Object::Table(alter.name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropTable { tbl_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Table(tbl_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropIndex { idx_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Index(idx_name.name.as_str().to_string()),
-        ),
-        ast::Stmt::DropView { view_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::View(view_name.name.as_str().to_string()),
-        ),
+        ast::Stmt::AlterTable(alter) => {
+            // Only a superuser may transfer ownership for now; the owner may
+            // run every other ALTER on its relation.
+            if !matches!(alter.body, ast::AlterTableBody::OwnerTo { .. })
+                && may_act_as_owner_of_table(resolver, connection, &alter.name)
+            {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Alter,
+                Object::Table(alter.name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            if may_act_as_owner_of_table(resolver, connection, tbl_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Table(tbl_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            let namespace = resolver.find_existing_index(idx_name).ok().flatten();
+            if may_act_as_owner(resolver, connection, namespace, idx_name.name.as_str()) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Index(idx_name.name.as_str().to_string()),
+            )
+        }
+        ast::Stmt::DropView { view_name, .. } => {
+            if may_act_as_owner_of_table(resolver, connection, view_name) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::View(view_name.name.as_str().to_string()),
+            )
+        }
         ast::Stmt::DropTrigger { trigger_name, .. } => PermissionDenied::owner(
             Action::Drop,
             Object::Trigger(trigger_name.name.as_str().to_string()),
@@ -97,10 +135,21 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::DropDomain { domain_name, .. } => {
             PermissionDenied::owner(Action::Drop, Object::Type(domain_name.to_string()))
         }
-        ast::Stmt::DropSequence { seq_name, .. } => PermissionDenied::owner(
-            Action::Drop,
-            Object::Sequence(seq_name.name.as_str().to_string()),
-        ),
+        ast::Stmt::DropSequence { seq_name, .. } => {
+            let normalized = crate::util::normalize_ident(seq_name.name.as_str());
+            let namespace = if seq_name.namespace.is_some() {
+                resolver.resolve_namespace(seq_name).ok()
+            } else {
+                resolver.find_existing_sequence(&normalized)
+            };
+            if may_act_as_owner(resolver, connection, namespace, seq_name.name.as_str()) {
+                return Ok(());
+            }
+            PermissionDenied::owner(
+                Action::Drop,
+                Object::Sequence(seq_name.name.as_str().to_string()),
+            )
+        }
         ast::Stmt::CreateSchema { .. } => database_denial(Action::Create),
         ast::Stmt::DropSchema { name } => {
             PermissionDenied::owner(Action::Drop, Object::Schema(name.as_str().to_string()))
@@ -127,6 +176,43 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
         ast::Stmt::Detach { .. } => database_denial(Action::Detach),
     };
     Err(permission_denied(denial))
+}
+
+/// Whether the current role may run an owner-gated statement on the table or
+/// view `name` names: the dialect says the role owns it. A relation that does not
+/// resolve is let through, so the statement fails in translation with its
+/// usual missing-relation error, as PostgreSQL orders the checks.
+fn may_act_as_owner_of_table(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    name: &ast::QualifiedName,
+) -> bool {
+    let namespace = resolver.find_existing_table(name).ok().flatten();
+    may_act_as_owner(resolver, connection, namespace, name.name.as_str())
+}
+
+/// [`may_act_as_owner_of_table`] with the relation already resolved: None
+/// means it does not exist, and translation reports that.
+fn may_act_as_owner(
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    namespace: Option<NamespaceRef>,
+    name: &str,
+) -> bool {
+    let Some(namespace) = namespace else {
+        return true;
+    };
+    if namespace.database_id != MAIN_DB_ID {
+        return false;
+    }
+    let normalized = crate::util::normalize_ident(name);
+    resolver.with_schema(MAIN_DB_ID, |schema| {
+        resolver
+            .catalog
+            .dialect
+            .relation_owner(schema, namespace.id, &normalized)
+            == Some(connection.current_role())
+    })
 }
 
 fn write_denial(tbl_name: &ast::QualifiedName) -> PermissionDenied {

@@ -41,8 +41,10 @@ use turso_core::{
     LimboError, Numeric, ProgramBuilder, RegisterOrLiteral, RelationChange, Value,
     SQLITE_CONSTRAINT_UNIQUE,
 };
+use turso_parser::ast;
 
 use turso_core::MAIN_DB_ID;
+use turso_pg_parser::translator::BOOTSTRAP_SUPERUSER_NAME;
 
 pub(crate) const CLASSES_TABLE_NAME: &str = "__turso_internal_classes";
 
@@ -194,6 +196,18 @@ impl ClassCatalog {
                     class.relname.clone_from(new_name);
                     class.relnamespace = *new_namespace;
                     self.add(class);
+                }
+            }
+            RelationChange::OwnerChanged {
+                namespace,
+                name,
+                owner,
+            } => {
+                if let Some(oid) = self.oids_by_name.get(&(*namespace, name.to_string())) {
+                    self.by_oid
+                        .get_mut(oid)
+                        .expect("both maps hold the row")
+                        .relowner = *owner;
                 }
             }
         }
@@ -384,6 +398,49 @@ pub(crate) fn emit_relations_renamed(
     for (old_name, new_name) in renames {
         emit_class_row_rename(program, &cursors, namespace, old_name, new_name);
     }
+    Ok(())
+}
+
+/// [`turso_core::Dialect::emit_relation_owner_change`] for the PostgreSQL
+/// frontend: `ALTER ... OWNER TO`, with PostgreSQL's errors for a missing
+/// role (42704) and a catalog relation (42501).
+pub(crate) fn emit_relation_owner_change(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+    namespace: NamespaceId,
+    name: &str,
+    new_owner: &ast::RoleSpec,
+) -> turso_core::Result<()> {
+    if !name_gets_class_row(name) {
+        return Err(LimboError::ParseError(format!(
+            "permission denied: \"{name}\" is a system catalog"
+        )));
+    }
+    let owner = match new_owner {
+        ast::RoleSpec::CurrentRole => connection.current_role(),
+        ast::RoleSpec::SessionUser => connection.session_role(),
+        ast::RoleSpec::Name(role_name) => {
+            if role_name == BOOTSTRAP_SUPERUSER_NAME {
+                RoleId::SUPERUSER
+            } else {
+                match schema.roles.get_by_name(role_name) {
+                    Some(role) => role.id,
+                    None => {
+                        return Err(LimboError::ParseError(format!(
+                            "role \"{role_name}\" does not exist"
+                        )))
+                    }
+                }
+            }
+        }
+    };
+    let Some(cursors) = open_class_table_for_writing(program, schema, false)? else {
+        return Err(LimboError::ParseError(
+            "the database has no relation catalog".to_string(),
+        ));
+    };
+    emit_class_row_set_owner(program, &cursors, namespace, name, owner);
     Ok(())
 }
 
@@ -631,6 +688,35 @@ fn emit_class_row_rename(
             old_name: old_name.to_string(),
             new_namespace: namespace,
             new_name: new_name.to_string(),
+        }),
+        id_reg: None,
+    });
+}
+
+/// Sets the owner of the class row of relation `name` of `namespace`.
+fn emit_class_row_set_owner(
+    program: &mut ProgramBuilder,
+    cursors: &ClassTableCursors,
+    namespace: NamespaceId,
+    name: &str,
+    owner: RoleId,
+) {
+    emit_find_class_row(program, cursors, namespace, name, |program, row| {
+        let record_reg = emit_class_record(
+            program,
+            ClassRecordColumn::Literal(name.to_string()),
+            ClassRecordColumn::LiteralInt(i64::from(namespace.as_u32())),
+            ClassRecordColumn::Register(row.relkind_reg),
+            ClassRecordColumn::LiteralInt(owner.get()),
+        );
+        emit_class_row_overwrite(program, cursors, row.rowid_reg, record_reg);
+    });
+    program.emit_insn(Insn::DialectRelationChange {
+        db: MAIN_DB_ID,
+        change: Box::new(RelationChange::OwnerChanged {
+            namespace,
+            name: name.to_string(),
+            owner,
         }),
         id_reg: None,
     });

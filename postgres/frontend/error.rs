@@ -314,8 +314,12 @@ fn parse_error_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_INVALID_COLUMN_REFERENCE
     } else if msg == "malformed JSON" {
         SQLSTATE_INVALID_TEXT_REPRESENTATION
-    } else if msg.starts_with("sequence \"") && msg.ends_with("\" does not exist") {
+    } else if (msg.starts_with("sequence \"") || msg.starts_with("relation \""))
+        && msg.ends_with("\" does not exist")
+    {
         SQLSTATE_UNDEFINED_TABLE
+    } else if msg.starts_with("role \"") && msg.ends_with("\" does not exist") {
+        SQLSTATE_UNDEFINED_OBJECT
     } else if (msg.starts_with("schema \"") && msg.ends_with("\" does not exist"))
         || msg == "no schema has been selected to create in"
     {

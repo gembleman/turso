@@ -1481,6 +1481,25 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+    /// `OWNER TO`: the relation's new owning role. Not SQLite syntax; a
+    /// frontend with roles translates its own OWNER TO into this.
+    OwnerTo {
+        role: RoleSpec,
+        /// `IF EXISTS`: a missing relation is not an error.
+        if_exists: bool,
+    },
+}
+
+/// A role named in DDL, like PostgreSQL's RoleSpec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RoleSpec {
+    /// A role by name.
+    Name(String),
+    /// `CURRENT_ROLE` and `CURRENT_USER`: the role the session runs as now.
+    CurrentRole,
+    /// `SESSION_USER`: the role the session logged in as.
+    SessionUser,
 }
 
 /// Operator mapping in a `CREATE TYPE` body

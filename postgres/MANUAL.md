@@ -86,10 +86,13 @@ keeps the role, and `DISCARD ALL` resets it.
 
 **Notes:**
 
-Ownership, `GRANT` and table privileges are not supported yet. A role that is
-not a superuser may read the rows of every table, but it cannot insert,
-update, delete or truncate rows, call `nextval` or `setval`, create, alter or
-drop objects, create roles, or `COPY FROM` a file.
+`GRANT` and table privileges are not supported yet. A role that is not a
+superuser may read the rows of every table, and it may alter and drop the
+relations it owns (see `ALTER TABLE ... OWNER TO`), but it cannot insert,
+update, delete or truncate rows, call `nextval` or `setval`, create objects
+or roles, or `COPY FROM` a file. Creating objects stays superuser-only
+because PostgreSQL gates it on the schema's CREATE privilege, which does not
+exist yet.
 
 **Examples:**
 
@@ -127,4 +130,47 @@ SELECT current_user;
 --------------
  postgres
 (1 row)
+```
+
+### `ALTER TABLE ... OWNER TO` — change a relation's owner
+
+**Synopsis:**
+
+```sql
+ALTER TABLE [ IF EXISTS ] name OWNER TO { role_name | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
+ALTER VIEW name OWNER TO role_name
+ALTER MATERIALIZED VIEW name OWNER TO role_name
+ALTER SEQUENCE name OWNER TO role_name
+ALTER INDEX name OWNER TO role_name
+```
+
+**Description:**
+
+`OWNER TO` makes `role_name` the owner of the relation. The owner may alter
+and drop the relation; every other role that is not a superuser gets
+`must be owner of table name` (SQLSTATE `42501`). `pg_class.relowner` stores
+the owner, and `pg_get_userbyid(relowner)` returns its name.
+
+**Parameters:**
+
+- `name`: An existing table, view, materialized view, sequence or index. A
+  missing relation is an error (`42P01`), unless `IF EXISTS` was given.
+- `role_name`: An existing role (`42704` when there is none), or
+  `CURRENT_ROLE`/`CURRENT_USER` for the role the session runs as now, or
+  `SESSION_USER` for the role the session logged in as.
+
+**Notes:**
+
+Only a superuser may change a relation's owner for now. PostgreSQL also lets
+the current owner transfer ownership when it is a member of the new role,
+which Turso does not support yet.
+
+**Examples:**
+
+```sql
+CREATE TABLE accounts (id int);
+CREATE ROLE jonathan;
+ALTER TABLE accounts OWNER TO jonathan;
+SET ROLE jonathan;
+DROP TABLE accounts;
 ```
