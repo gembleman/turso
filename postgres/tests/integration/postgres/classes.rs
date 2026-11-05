@@ -310,3 +310,19 @@ fn a_rolled_back_create_leaves_no_class_row_behind() {
     let (_, _, _, kind, _) = class_row(&conn, "t").unwrap();
     assert_eq!(kind, "r");
 }
+
+#[test]
+fn capture_data_changes_is_refused_under_the_postgres_dialect() {
+    // CDC tables are created at run time, outside the DDL that maintains
+    // the relation catalog, so they would be relations without class rows.
+    let db = TempDatabase::builder().build();
+    let pg = db.connect_postgres();
+    let error = pg
+        .pragma_update("unstable_capture_data_changes_conn", "'full'")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("capture_data_changes is not supported"),
+        "{error}"
+    );
+}
