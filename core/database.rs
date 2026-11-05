@@ -353,6 +353,8 @@ pub enum OpenDbAsyncPhase {
     /// bootstrap, because before it an MVCC database has no table roots and
     /// has not replayed its logical log.
     LoadingRoles,
+    /// Reads the dialect's own schema state, after the roles it refers to.
+    LoadingDialectSchema,
     Done,
 }
 
@@ -579,6 +581,10 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    /// The dialect schema state scan of `LoadingDialectSchema` and the rows
+    /// read so far, held across yields.
+    dialect_schema_stmt: Option<Box<Statement>>,
+    dialect_schema_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -605,6 +611,8 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            dialect_schema_stmt: None,
+            dialect_schema_rows: Vec::new(),
         }
     }
 }
@@ -1850,6 +1858,44 @@ impl Database {
                             Arc::new(crate::security::roles::RoleCatalog::new(&state.role_rows)?);
                         db.with_schema_mut(|schema| {
                             schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::LoadingDialectSchema;
+                }
+
+                OpenDbAsyncPhase::LoadingDialectSchema => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.dialect_schema_stmt.is_none() && state.dialect_schema_rows.is_empty() {
+                        let query = {
+                            let schema = conn.schema.read();
+                            db.dialect().schema_state_query(&schema)
+                        };
+                        if let Some(sql) = query {
+                            state.dialect_schema_stmt =
+                                Some(Box::new(conn.prepare_dialect_schema_read(&sql)?));
+                        }
+                    }
+                    if let Some(stmt) = state.dialect_schema_stmt.as_mut() {
+                        let rows = &mut state.dialect_schema_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.dialect_schema_stmt = None;
+                        db.with_schema_mut(|schema| {
+                            schema.dialect_schema = Some(
+                                db.dialect()
+                                    .build_schema_state(schema, &state.dialect_schema_rows)?,
+                            );
                             Ok(())
                         })?;
                     }

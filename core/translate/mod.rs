@@ -128,6 +128,7 @@ pub fn translate(
         origin,
         crate::statement::StatementOrigin::InternalHelper
             | crate::statement::StatementOrigin::EngineMetadataRead
+            | crate::statement::StatementOrigin::EngineSchemaWrite
     );
     let search_path = if is_engine_statement {
         None
@@ -409,7 +410,7 @@ fn translate_statement(
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,
-        } => translate_drop_index(&idx_name, resolver, if_exists, program)?,
+        } => translate_drop_index(&idx_name, resolver, if_exists, connection, program)?,
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
@@ -421,7 +422,7 @@ fn translate_statement(
         ast::Stmt::DropView {
             if_exists,
             view_name,
-        } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        } => view::translate_drop_view(resolver, &view_name, if_exists, connection, program)?,
         ast::Stmt::CreateRole { role_name } => {
             roles::translate_create_role(&role_name, resolver, program)?
         }
@@ -556,7 +557,7 @@ fn translate_statement(
             if_exists,
             seq_name,
         } => {
-            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
+            sequence::translate_drop_sequence(&seq_name, if_exists, resolver, connection, program)?;
         }
         ast::Stmt::CreateSchema { name } => {
             schema::translate_create_schema(&name, resolver, program)?;

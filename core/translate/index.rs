@@ -354,6 +354,16 @@ pub fn translate_create_index(
         Some(sql),
     )?;
 
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_created(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[(idx_name.clone(), crate::schema::RelationKind::Index)],
+        )?;
+    }
+
     emit_refill_index(
         program,
         resolver,
@@ -1416,6 +1426,7 @@ pub fn translate_drop_index(
     qualified_name: &QualifiedName,
     resolver: &Resolver,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> crate::Result<()> {
     let idx_name = normalize_ident(qualified_name.name.as_str());
@@ -1479,6 +1490,16 @@ pub fn translate_drop_index(
         database_id,
         Some(SQLITE_TABLEID),
     )?;
+
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_dropped(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[idx_name.clone()],
+        )?;
+    }
 
     // According to sqlite should emit Null instruction
     // but why?

@@ -3,6 +3,7 @@ use crate::namespace::{NamespaceId, NamespaceRef};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::types::StrictType;
+use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::{turso_assert_eq, turso_assert_ne, SymbolTable};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -1675,6 +1676,32 @@ pub fn translate_alter_table(
                     &mangled_table_name,
                     &mangled_new_name,
                 );
+            }
+
+            if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+                // Automatic indexes are renamed with the table, because
+                // their names embed it.
+                let mut renames = vec![(normalized_old_name, normalized_new_name)];
+                let old_index_prefix =
+                    format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{mangled_table_name}_");
+                for index in &table_indexes {
+                    let Some(ordinal) = index.name.strip_prefix(&old_index_prefix) else {
+                        continue;
+                    };
+                    renames.push((
+                        index.name.clone(),
+                        format!(
+                            "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{mangled_new_name}_{ordinal}"
+                        ),
+                    ));
+                }
+                resolver.catalog.dialect.emit_relations_renamed(
+                    program,
+                    resolver.schema(),
+                    connection,
+                    namespace.id,
+                    &renames,
+                )?;
             }
 
             for (trigger_name, new_sql, renames_target) in temp_triggers_to_rewrite {

@@ -15204,6 +15204,35 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_dialect_relation_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(DialectRelationChange { db, change, id_reg }, insn);
+    let new_id = match id_reg {
+        Some(id_reg) => {
+            let Value::Numeric(Numeric::Integer(id)) = state.registers[*id_reg].get_value() else {
+                return Err(LimboError::InternalError(format!(
+                    "DialectRelationChange: id register r[{id_reg}] does not hold an integer"
+                ))
+                .into());
+            };
+            Some(*id)
+        }
+        None => None,
+    };
+    let dialect = program.connection.dialect();
+    program
+        .connection
+        .with_database_schema_mut(*db, |schema| {
+            dialect.apply_relation_change(schema, change, new_id)
+        })??;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads

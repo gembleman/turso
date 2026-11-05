@@ -2103,6 +2103,15 @@ pub fn insn_to_row(
                 0,
                 format!("add role {name} id=r[{id_reg}] superuser={superuser}"),
             ),
+            Insn::DialectRelationChange { db, change, id_reg } => (
+                "DialectRelationChange",
+                *db as i64,
+                id_reg.map_or(0, |id_reg| id_reg as i64),
+                0,
+                Value::build_text(format!("{change:?}")),
+                0,
+                "tell the dialect a relation changed".to_string(),
+            ),
             Insn::DropView {
                 db,
                 namespace: _,

@@ -28,6 +28,29 @@ pub const POSTGRES_TABLE_SQL_PREFIX: &str = "/* turso_frontend:postgres */ ";
 /// SQLite-compatible callers pass `turso_sqlite::SqliteDialect`. Initial statement
 /// preparation, re-preparation, and every schema load go through this
 /// interface.
+/// A change to a relation of the main database that a running statement
+/// wrote to the dialect's own schema state, told back to the dialect by
+/// [`Dialect::apply_relation_change`] so its in-memory copy follows.
+#[derive(Debug, Clone)]
+pub enum RelationChange {
+    Created {
+        namespace: crate::namespace::NamespaceId,
+        name: String,
+        kind: crate::schema::RelationKind,
+        owner: crate::security::roles::RoleId,
+    },
+    Dropped {
+        namespace: crate::namespace::NamespaceId,
+        name: String,
+    },
+    Renamed {
+        old_namespace: crate::namespace::NamespaceId,
+        old_name: String,
+        new_namespace: crate::namespace::NamespaceId,
+        new_name: String,
+    },
+}
+
 pub trait Dialect: Send + Sync + 'static {
     /// Stable identifier for this dialect (e.g. "sqlite", "postgres").
     ///
@@ -210,6 +233,95 @@ pub trait Dialect: Send + Sync + 'static {
     /// ordinary table.
     fn supports_roles(&self) -> bool {
         false
+    }
+
+    /// SQL that reads the dialect's own schema state, such as the PostgreSQL
+    /// frontend's relation catalog table, or None when this database keeps
+    /// none. The statement runs with engine semantics after the schema rows
+    /// load, and its rows go to [`Dialect::build_schema_state`].
+    fn schema_state_query(&self, schema: &crate::schema::Schema) -> Option<String> {
+        let _ = schema;
+        None
+    }
+
+    /// Builds [`crate::schema::Schema::dialect_schema`] from the rows that
+    /// [`Dialect::schema_state_query`] returned. `schema` is the schema the
+    /// state is built for, already holding every other object.
+    fn build_schema_state(
+        &self,
+        schema: &crate::schema::Schema,
+        rows: &[Vec<crate::Value>],
+    ) -> crate::Result<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        let _ = (schema, rows);
+        Err(crate::LimboError::InternalError(
+            "the dialect queried schema state it cannot build".to_string(),
+        ))
+    }
+
+    /// Emits the bytecode that records newly created relations of `namespace`
+    /// of the main database in the dialect's own schema state, in the same
+    /// transaction as the statement's `sqlite_schema` rows. Does nothing for
+    /// a dialect without schema state of its own.
+    fn emit_relations_created(
+        &self,
+        program: &mut crate::vdbe::builder::ProgramBuilder,
+        schema: &crate::schema::Schema,
+        connection: &std::sync::Arc<crate::Connection>,
+        namespace: crate::namespace::NamespaceId,
+        relations: &[(String, crate::schema::RelationKind)],
+    ) -> crate::Result<()> {
+        let _ = (program, schema, connection, namespace, relations);
+        Ok(())
+    }
+
+    /// [`Dialect::emit_relations_created`] for dropped relations.
+    fn emit_relations_dropped(
+        &self,
+        program: &mut crate::vdbe::builder::ProgramBuilder,
+        schema: &crate::schema::Schema,
+        connection: &std::sync::Arc<crate::Connection>,
+        namespace: crate::namespace::NamespaceId,
+        names: &[String],
+    ) -> crate::Result<()> {
+        let _ = (program, schema, connection, namespace, names);
+        Ok(())
+    }
+
+    /// [`Dialect::emit_relations_created`] for renamed relations, given as
+    /// `(old name, new name)`: the renamed table and the automatic indexes
+    /// whose names embed it.
+    fn emit_relations_renamed(
+        &self,
+        program: &mut crate::vdbe::builder::ProgramBuilder,
+        schema: &crate::schema::Schema,
+        connection: &std::sync::Arc<crate::Connection>,
+        namespace: crate::namespace::NamespaceId,
+        renames: &[(String, String)],
+    ) -> crate::Result<()> {
+        let _ = (program, schema, connection, namespace, renames);
+        Ok(())
+    }
+
+    /// Applies `change` to the dialect's schema state in `schema` while the
+    /// statement that wrote it runs, so the in-memory copy follows the
+    /// stored rows. `new_id` carries the id the dialect's state gave a
+    /// created relation, read from the register its emit hook named.
+    fn apply_relation_change(
+        &self,
+        schema: &mut crate::schema::Schema,
+        change: &RelationChange,
+        new_id: Option<i64>,
+    ) -> crate::Result<()> {
+        let _ = (schema, change, new_id);
+        Ok(())
+    }
+
+    /// Whether relations can be created, renamed or dropped in an attached
+    /// database. The PostgreSQL frontend refuses it: its relation catalog
+    /// covers only the main database, so a database file with relations
+    /// made while it was attached could not be opened later.
+    fn supports_relation_ddl_in_attached_databases(&self) -> bool {
+        true
     }
 
     /// The namespaces of a database that has never created or dropped one.

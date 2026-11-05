@@ -6,6 +6,8 @@ use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, ResultType, ReturnType};
 use crate::namespace::is_reserved_object_name;
 use crate::namespace::{NamespaceId, NamespaceRef};
+
+use crate::schema::RelationKind;
 use crate::schema::{
     create_table, translate_ident_to_string_literal, type_registry_key, BTreeCharacteristics,
     BTreeTable, ColDef, Column, Index, Schema, SchemaObjectType, StructDef, Table, Type, TypeDef,
@@ -1374,11 +1376,15 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
+    // The resolver's dialect is the one the statement was parsed with: the
+    // engine's own for an engine schema statement, which stores plain SQLite
+    // text, the connection's otherwise.
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else if bound_sequence_names {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_rewritten_table_sql(&ast::Stmt::CreateTable {
                 temporary,
                 if_not_exists,
@@ -1386,8 +1392,9 @@ pub fn translate_create_table(
                 body: body.clone(),
             })?
     } else {
-        connection
-            .dialect()
+        resolver
+            .catalog
+            .dialect
             .format_table_sql(input, &tbl_name_in_sql, &body)?
     };
 
@@ -1473,6 +1480,7 @@ pub fn translate_create_table(
         Some(sql),
     )?;
 
+    let autoindex_count = index_regs.as_ref().map_or(0, Vec::len);
     if let Some(index_regs) = index_regs {
         for (idx, index_reg) in index_regs.into_iter().enumerate() {
             let index_name = format!(
@@ -1492,6 +1500,23 @@ pub fn translate_create_table(
                 None,
             )?;
         }
+    }
+
+    if dialect_relation_hooks_apply(connection, database_id)? {
+        let mut relations = vec![(normalized_tbl_name.clone(), RelationKind::Table)];
+        for n in 1..=autoindex_count {
+            relations.push((
+                format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{mangled_tbl_name}_{n}"),
+                RelationKind::Index,
+            ));
+        }
+        resolver.catalog.dialect.emit_relations_created(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &relations,
+        )?;
     }
 
     // Create the backing table for the hidden AUTOINCREMENT sequence. The
@@ -2440,6 +2465,20 @@ pub fn translate_drop_table(
             .cloned()
             .collect()
     });
+
+    // Dropping a table also drops its indexes, the automatic ones among
+    // them, so the dialect hears about all of them.
+    if table.btree().is_some() && dialect_relation_hooks_apply(connection, database_id)? {
+        let mut names = vec![normalize_ident(name)];
+        names.extend(indices.iter().map(|index| index.name.clone()));
+        resolver.catalog.dialect.emit_relations_dropped(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &names,
+        )?;
+    }
     for index in &indices {
         if index.index_method.is_some() && !index.is_backing_btree_index() {
             // Index methods without backing btree need special destroy handling
@@ -3096,6 +3135,34 @@ pub(crate) fn emit_schema_cookie(resolver: &Resolver, program: &mut ProgramBuild
         value: (resolver.schema().schema_version + 1) as i32,
         p5: 0,
     });
+}
+
+/// Whether the statement tells the dialect about the relations it creates,
+/// renames or drops, through the [`crate::Dialect`] relation hooks. Only new
+/// DDL of a user against the main database does: a nested statement replays
+/// stored schema text, as VACUUM does when it copies a database, and the
+/// MVCC bootstrap connection replays log entries; both carry the dialect's
+/// schema state as data already. Relations of other databases, temp among
+/// them, have no dialect schema state. Fails for DDL of a user against an
+/// attached database when the dialect does not allow it.
+pub(crate) fn dialect_relation_hooks_apply(
+    connection: &Arc<Connection>,
+    database_id: usize,
+) -> Result<bool> {
+    if connection.is_nested_stmt() || connection.is_mvcc_bootstrap_connection() {
+        return Ok(false);
+    }
+    if crate::is_attached_db(database_id)
+        && !connection
+            .db
+            .dialect()
+            .supports_relation_ddl_in_attached_databases()
+    {
+        bail_parse_error!(
+            "creating, renaming or dropping relations in an attached database is not supported"
+        );
+    }
+    Ok(database_id == MAIN_DB_ID)
 }
 
 pub fn translate_create_type(

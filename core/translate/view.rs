@@ -205,7 +205,7 @@ pub fn translate_create_materialized_view(
     program.preassign_label_to_next_insn(clear_loop_label);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
-        table_name: normalized_view_name,
+        table_name: normalized_view_name.clone(),
         is_part_of_update: false,
     });
     program.emit_insn(Insn::Next {
@@ -241,6 +241,21 @@ pub fn translate_create_materialized_view(
         view_root_reg, // btree root for materialized view data
         Some(sql),
     )?;
+
+    // The view is a relation of the dialect's; its hidden state tables are
+    // engine objects and are not.
+    if crate::translate::schema::dialect_relation_hooks_apply(&connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_created(
+            program,
+            resolver.schema(),
+            &connection,
+            namespace.id,
+            &[(
+                normalized_view_name,
+                crate::schema::RelationKind::MaterializedView,
+            )],
+        )?;
+    }
 
     // Create the version marker and node-owned operator storage described by
     // the maintenance plan. Stateful tables expose a primary-key index used by
@@ -459,6 +474,16 @@ pub fn translate_create_view(
         Some(sql),
     )?;
 
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_created(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[(normalized_view_name, crate::schema::RelationKind::View)],
+        )?;
+    }
+
     // Parse schema to load the new view
     let escaped_view_name = escape_sql_string_literal(&stored_view_name);
     program.emit_insn(Insn::ParseSchema {
@@ -499,6 +524,7 @@ pub fn translate_drop_view(
     resolver: &Resolver,
     view_name: &ast::QualifiedName,
     if_exists: bool,
+    connection: &Arc<crate::Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     // Unqualified names search the temp schema first, then main, then
@@ -631,6 +657,16 @@ pub fn translate_drop_view(
                 });
             }
         }
+    }
+
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_dropped(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[normalized_view_name.clone()],
+        )?;
     }
 
     // Open cursor to sqlite_schema table (structure is the same for all databases)

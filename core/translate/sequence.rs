@@ -970,6 +970,21 @@ pub fn translate_create_sequence(
         seq.cycle,
     )?;
 
+    // The sequence is a relation of the dialect's; its backing table is an
+    // engine object and is not.
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_created(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[(
+                normalized_name.clone(),
+                crate::schema::RelationKind::Sequence,
+            )],
+        )?;
+    }
+
     // Add the fully-configured Sequence to the in-memory schema
     program.emit_insn(Insn::AddSequence {
         data: Box::new(AddSequenceData {
@@ -1112,6 +1127,7 @@ pub fn translate_drop_sequence(
     seq_name: &ast::QualifiedName,
     if_exists: bool,
     resolver: &Resolver,
+    connection: &Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
     let normalized_name = normalize_ident(seq_name.name.as_str());
@@ -1134,6 +1150,16 @@ pub fn translate_drop_sequence(
             return Ok(());
         }
         bail_parse_error!("sequence \"{}\" does not exist", normalized_name);
+    }
+
+    if crate::translate::schema::dialect_relation_hooks_apply(connection, database_id)? {
+        resolver.catalog.dialect.emit_relations_dropped(
+            program,
+            resolver.schema(),
+            connection,
+            namespace.id,
+            &[normalized_name.clone()],
+        )?;
     }
 
     // Bump schema version so other connections detect the change
