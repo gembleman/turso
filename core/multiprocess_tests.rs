@@ -1115,6 +1115,86 @@ fn multiprocess_shm_schema_child_process() {
         .unwrap();
 }
 
+fn attached_count(conn: &Arc<Connection>) -> String {
+    get_rows(conn, "select count(*) from owned.test")[0][0].to_string()
+}
+
+fn attached_multiprocess_reader_sees_other_process_commits(main_read_only: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let main_path = dir.path().join("attach-main.db");
+    let owned_path = dir.path().join("attach-owned.db");
+    let main_path_str = main_path.to_str().unwrap();
+    let owned_path_str = owned_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+
+    let owned_db = open_multiprocess_db(io.clone(), owned_path_str).unwrap();
+    let owned_conn = owned_db.connect(ConnectOpts::new()).unwrap();
+    owned_conn
+        .execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    owned_conn
+        .execute("insert into test(value) values ('parent')")
+        .unwrap();
+    let main_db = open_multiprocess_db(io.clone(), main_path_str).unwrap();
+    main_db
+        .connect(ConnectOpts::new())
+        .unwrap()
+        .execute("create table main_t(id integer primary key)")
+        .unwrap();
+    drop(main_db);
+    drop(owned_conn);
+    drop(owned_db);
+
+    let flags = if main_read_only {
+        OpenFlags::ReadOnly
+    } else {
+        OpenFlags::default()
+    };
+    let main_db = Database::open_file_with_flags(
+        io,
+        main_path_str,
+        flags,
+        multiprocess_wal_db_opts().with_attach(true),
+        None,
+        Arc::new(EngineDialect),
+    )
+    .unwrap();
+    let conn = main_db.connect(ConnectOpts::new()).unwrap();
+    conn.execute(format!("attach '{owned_path_str}' as owned"))
+        .unwrap();
+    assert_eq!(attached_count(&conn), "1");
+
+    let child_output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_SHM_INSERT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", owned_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "child writer to attached db failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+
+    assert_eq!(
+        attached_count(&conn),
+        "2",
+        "long-lived connection must observe another process's commit to the attached db"
+    );
+}
+
+#[test]
+fn attached_db_observes_other_process_commits_with_multiprocess_wal() {
+    attached_multiprocess_reader_sees_other_process_commits(false);
+}
+
+#[test]
+fn attached_db_observes_other_process_commits_with_read_only_multiprocess_wal() {
+    attached_multiprocess_reader_sees_other_process_commits(true);
+}
+
 #[test]
 fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
