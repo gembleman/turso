@@ -420,13 +420,17 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 /// the copy fail.
 ///
 /// Normally the copy is built in a temporary file beside the destination
-/// and moved over it once complete and synced. The target is committed in
+/// and moved to it once complete and synced. The target is committed in
 /// batches, so until then the file is a valid database holding only some
 /// of the rows. Built under the destination's own name, that is what a
 /// statement that fails or a process that dies partway would leave behind —
 /// and a retry would refuse the "existing" output. This way the
 /// destination path only ever holds a complete copy, as it did when the
-/// whole copy was one transaction.
+/// whole copy was one transaction. The move never replaces: should a file
+/// have appeared at the destination since `prepare` found it absent, the
+/// move fails and the statement reports an existing output file, as it
+/// does for one it finds at the start. That file is not touched, and the
+/// temporary copy is discarded.
 ///
 /// The temporary file is named for this process and this statement
 /// (`<destination>-vacuum-<pid>-<n>.tmp`), so it is never the source — a
@@ -557,13 +561,16 @@ impl VacuumIntoOutputFile {
     /// `SyncMode::Full` and closed, so the file is self-contained and synced
     /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
     /// logical log moves with it. The move is the IO's rename, so the
-    /// destination goes from absent to complete in one step, durably. The
-    /// log moves after the copy: should the process die between the two,
-    /// the destination holds a complete copy and the log is left under the
-    /// temporary name, where it troubles nothing (a log under the
-    /// destination's name beside no database would make a later non-MVCC
-    /// copy there look corrupt). Should the log fail to move, the copy is
-    /// moved back, so the destination is as it was found.
+    /// destination goes from absent to complete in one step, durably, and a
+    /// file that appeared there since `prepare` is never replaced: the
+    /// statement then fails with the error for an existing output file, and
+    /// `discard` removes the copy. The log moves after the copy: should the
+    /// process die between the two, the destination holds a complete copy
+    /// and the log is left under the temporary name, where it troubles
+    /// nothing (a log under the destination's name beside no database would
+    /// make a later non-MVCC copy there look corrupt). Should the log fail to move, the copy is
+    /// moved back, so the destination is as it was found. The log does not
+    /// replace one either.
     pub fn install(&self) -> Result<()> {
         let Some(temp_path) = &self.temp_path else {
             return Ok(());
@@ -571,7 +578,9 @@ impl VacuumIntoOutputFile {
         for sidecar in ["-wal", "-shm"] {
             remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
         }
-        self.io.rename_file(temp_path, &self.dest_path)?;
+        self.io
+            .rename_file(temp_path, &self.dest_path)
+            .map_err(|err| output_exists_or(err, &self.dest_path))?;
         let temp_log = logical_log_path(temp_path);
         if std::fs::metadata(&temp_log).is_err() {
             return Ok(());
@@ -585,9 +594,22 @@ impl VacuumIntoOutputFile {
                     self.dest_path
                 );
             }
-            return Err(err);
+            return Err(output_exists_or(err, &dest_log));
         }
         Ok(())
+    }
+}
+
+/// The error `VACUUM INTO` raises for an output file it finds at `path`,
+/// for a failed no-replace move (see [`crate::IO::rename_file`]) that found
+/// one; any other error as it is.
+fn output_exists_or(err: LimboError, path: &str) -> LimboError {
+    match err {
+        LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::AlreadyExists,
+            _,
+        )) => LimboError::ParseError(format!("output file already exists: {path}")),
+        err => err,
     }
 }
 
@@ -4575,6 +4597,89 @@ mod tests {
             !at_destination.is_temporary() && at_destination.build_path() == dest,
             "a temporary copy for a destination that exists"
         );
+        Ok(())
+    }
+
+    /// The IO's rename never replaces: a file at the new name makes it fail
+    /// with `AlreadyExists` and both files stay as they were.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn rename_file_durably_does_not_replace_an_existing_file() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let from_path = dir.path().join("from");
+        let to_path = dir.path().join("to");
+        let (from, to) = (from_path.to_str().unwrap(), to_path.to_str().unwrap());
+        std::fs::write(&from_path, b"moved").unwrap();
+        std::fs::write(&to_path, b"already here").unwrap();
+
+        let err = crate::io::rename_file_durably(from, to).expect_err("the new name is taken");
+        assert!(
+            matches!(
+                err,
+                LimboError::CompletionError(crate::CompletionError::IOError(
+                    std::io::ErrorKind::AlreadyExists,
+                    _
+                ))
+            ),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&from_path).unwrap(), b"moved");
+        assert_eq!(std::fs::read(&to_path).unwrap(), b"already here");
+
+        std::fs::remove_file(&to_path).unwrap();
+        crate::io::rename_file_durably(from, to)?;
+        assert!(!from_path.exists());
+        assert_eq!(std::fs::read(&to_path).unwrap(), b"moved");
+        Ok(())
+    }
+
+    /// A file that appears at the destination after `prepare` found it
+    /// absent is not replaced: `install` fails with the error for an
+    /// existing output file, the file is as it was, and `discard` removes
+    /// the temporary copy with its WAL, shm and log.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_install_does_not_replace_a_destination_that_appeared() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+
+        let output = VacuumIntoOutputFile::prepare(io, dest)?;
+        assert!(output.is_temporary());
+        let temp = output.build_path().to_string();
+        for file in output.temp_files() {
+            std::fs::write(&file, b"the copy").unwrap();
+        }
+        // Another process creates the destination while the copy is built.
+        std::fs::write(&dest_path, b"somebody else's database").unwrap();
+
+        let err = output.install().expect_err("the destination appeared");
+        assert!(
+            matches!(&err, LimboError::ParseError(message)
+                if message == &format!("output file already exists: {dest}")),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&dest_path).unwrap(),
+            b"somebody else's database"
+        );
+        assert!(
+            std::fs::metadata(&temp).is_ok(),
+            "the copy is for discard to remove"
+        );
+
+        output.discard(false)?;
+        assert_eq!(
+            temp_copies_beside(&dest_path),
+            Vec::<std::path::PathBuf>::new(),
+            "the failed install left its temporary copy behind"
+        );
+        assert_eq!(
+            std::fs::read(&dest_path).unwrap(),
+            b"somebody else's database"
+        );
+        assert!(!std::path::Path::new(&logical_log_path(dest)).exists());
         Ok(())
     }
 
