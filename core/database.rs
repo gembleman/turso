@@ -93,10 +93,6 @@ pub struct DatabaseOpts {
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
-    /// Start every connection made through [`Database::connect`] and
-    /// [`Database::connect_async`] with `PRAGMA foreign_keys` on. Off by
-    /// default, like SQLite; a connection can still turn it off.
-    pub foreign_keys: bool,
     pub(crate) enable_load_extension: bool,
 }
 
@@ -168,11 +164,6 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
-        self
-    }
-
-    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
-        self.foreign_keys = enable;
         self
     }
 }
@@ -577,6 +568,7 @@ pub struct ConnectOpts {
     role: SessionRole,
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    foreign_keys: bool,
 }
 
 impl ConnectOpts {
@@ -587,6 +579,7 @@ impl ConnectOpts {
             role,
             encryption_key: None,
             page_codec: None,
+            foreign_keys: false,
         }
     }
 
@@ -602,6 +595,16 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Starts the connection with `PRAGMA foreign_keys` on (set directly, no SQL
+    /// is run). Off by default, like SQLite; the connection can still turn it
+    /// off. This belongs to the connection, not to [`DatabaseOpts`]: a
+    /// [`Database`] is shared by every opener of the same file, so a database
+    /// wide default would be dropped silently whenever the file is already open.
+    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
+        self.foreign_keys = enable;
         self
     }
 }
@@ -2739,16 +2742,17 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        let foreign_keys = opts.foreign_keys;
         let conn = self._connect(opts, context, false, None, StatsRefresh::Blocking)?;
-        self.apply_connection_defaults(&conn);
+        Self::apply_connect_opts(&conn, foreign_keys);
         Ok(conn)
     }
 
-    /// Settings that [`DatabaseOpts`] makes the default of every connection
-    /// handed to a caller. Internal connections (open, MVCC bootstrap, vacuum)
-    /// keep the engine defaults.
-    fn apply_connection_defaults(&self, conn: &Connection) {
-        if self.opts.foreign_keys {
+    /// Settings of [`ConnectOpts`] that are applied to the new connection
+    /// itself. Internal connections (open, MVCC bootstrap, vacuum) keep the
+    /// engine defaults.
+    fn apply_connect_opts(conn: &Connection, foreign_keys: bool) {
+        if foreign_keys {
             conn.set_foreign_keys_enabled(true);
         }
     }
@@ -2809,6 +2813,7 @@ impl Database {
                         opts.page_codec.as_ref()
                     ));
                     let opts = state.opts.take().expect("initial connect options are set");
+                    let foreign_keys = opts.foreign_keys;
                     let conn = self._connect(
                         opts,
                         ConnectionContext::default(),
@@ -2816,7 +2821,7 @@ impl Database {
                         Some(Arc::new(pager)),
                         StatsRefresh::Deferred,
                     )?;
-                    self.apply_connection_defaults(&conn);
+                    Self::apply_connect_opts(&conn, foreign_keys);
                     state.conn = Some(conn.clone());
                     conn
                 }
