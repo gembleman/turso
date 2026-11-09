@@ -238,6 +238,12 @@ impl Sorter {
         self.records.is_empty() && self.chunks.is_empty()
     }
 
+    /// Number of records buffered in memory, i.e. the amount of work the next
+    /// in-memory `sort` does.
+    pub fn in_memory_len(&self) -> usize {
+        self.records.len()
+    }
+
     pub const fn has_more(&self) -> bool {
         self.current.is_some()
     }
