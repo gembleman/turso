@@ -13644,8 +13644,8 @@ pub fn op_open_write(
     if connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    if program.writes_stats_tables && *db == crate::MAIN_DB_ID {
-        crate::stats::note_stats_table_write(connection);
+    if program.stats_write_dbs.contains(db) {
+        crate::stats::note_stats_table_write(connection, *db);
     }
     let pager = connection.get_pager_from_database_index(db)?;
     let mv_store = connection.mv_store_for_db(*db);
@@ -14084,8 +14084,8 @@ pub fn op_destroy(
         insn
     );
     check_db_write_allowed(program, state, None)?;
-    if program.writes_stats_tables && *db == MAIN_DB_ID {
-        crate::stats::note_stats_table_write(connection);
+    if program.stats_write_dbs.contains(db) {
+        crate::stats::note_stats_table_write(connection, *db);
     }
     let mv_store = connection.mv_store_for_db(*db);
     if mv_store.is_some() {
@@ -14136,9 +14136,9 @@ pub fn op_clear_btree(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     check_db_write_allowed(program, state, None)?;
-    if program.writes_stats_tables {
-        if let Insn::ClearBtree { db: MAIN_DB_ID, .. } = insn {
-            crate::stats::note_stats_table_write(connection);
+    if let Insn::ClearBtree { db, .. } = insn {
+        if program.stats_write_dbs.contains(db) {
+            crate::stats::note_stats_table_write(connection, *db);
         }
     }
     match op_clear_btree_inner(program, state, insn, connection, pager) {

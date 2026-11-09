@@ -378,3 +378,80 @@ fn delete_all_stat1_rows_refreshes_stats_for_new_connections() {
     assert_eq!(t_row_count(&conn), None);
     assert_eq!(scans(&db), before);
 }
+
+/// An analyzed file database `aux.db` (kept open by the returned handles),
+/// and a separate in-memory connection with it attached as `aux`.
+fn attached_analyzed_db(
+    dir: &std::path::Path,
+) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+    let aux_path = dir.join("aux.db");
+    let aux_path = aux_path.to_str().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let aux_db = Database::open_file_with_flags(
+        io,
+        aux_path,
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let direct = connect(&aux_db);
+    direct
+        .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    direct.execute("CREATE INDEX t_b ON t (b)").unwrap();
+    direct
+        .execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+        .unwrap();
+    direct.execute("ANALYZE").unwrap();
+    assert_eq!(t_row_count(&connect(&aux_db)), Some(3));
+
+    let main_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let main_db = Database::open_file_with_flags(
+        main_io,
+        ":memory:",
+        OpenFlags::Create,
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let main = connect(&main_db);
+    main.execute(format!("ATTACH '{aux_path}' AS aux")).unwrap();
+    (aux_db, direct, main)
+}
+
+#[test]
+fn attached_stat1_writes_refresh_stats_for_the_attached_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+    let before = scans(&aux_db);
+    main.execute("DELETE FROM aux.sqlite_stat1 WHERE tbl = 't'")
+        .unwrap();
+    let conn = connect(&aux_db);
+    assert_eq!(t_row_count(&conn), None);
+    assert!(scans(&aux_db) > before, "the write must invalidate aux.db");
+}
+
+#[test]
+fn attached_delete_all_stat1_rows_refreshes_stats_for_the_attached_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+    main.execute("DELETE FROM aux.sqlite_stat1").unwrap();
+    let conn = connect(&aux_db);
+    assert_eq!(t_row_count(&conn), None);
+}
+
+#[test]
+fn attached_uncommitted_stat1_writes_are_not_cached_as_fresh() {
+    let dir = tempfile::tempdir().unwrap();
+    let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+    main.execute("BEGIN").unwrap();
+    main.execute("DELETE FROM aux.sqlite_stat1").unwrap();
+    for _ in 0..2 {
+        assert_eq!(t_row_count(&connect(&aux_db)), Some(3));
+    }
+    main.execute("COMMIT").unwrap();
+    assert_eq!(t_row_count(&connect(&aux_db)), None);
+}

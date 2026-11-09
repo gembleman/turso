@@ -81,43 +81,55 @@ impl StatsFreshness {
     /// treated as finished and invalidates the stats.
     fn writer_in_flight(&self) -> bool {
         let mut writers = self.writers.lock();
-        writers.retain(|writer| match writer.upgrade() {
-            Some(conn) if conn.stats_table_written.load(Ordering::SeqCst) => {
-                if conn.get_tx_state() == TransactionState::None {
-                    conn.stats_table_written.store(false, Ordering::SeqCst);
-                    self.invalidate();
-                    false
-                } else {
-                    true
-                }
-            }
-            Some(_) => false,
-            None => {
+        writers.retain(|writer| {
+            let Some(conn) = writer.upgrade() else {
+                self.invalidate();
+                return false;
+            };
+            let mut written = conn.stats_tables_written.lock();
+            // The connection wrote this database's stats tables only while
+            // its entry is in the list; finishing the write removes it.
+            let Some(pos) = written
+                .iter()
+                .position(|db| std::ptr::eq(&db.stats_freshness, self))
+            else {
+                return false;
+            };
+            if conn.get_tx_state() == TransactionState::None {
+                written.remove(pos);
                 self.invalidate();
                 false
+            } else {
+                true
             }
         });
         !writers.is_empty()
     }
 }
 
-/// A statement of `conn` is about to write `sqlite_stat1`/`sqlite_stat4` of the
-/// main database.
-pub(crate) fn note_stats_table_write(conn: &Arc<Connection>) {
-    if !conn.stats_table_written.swap(true, Ordering::SeqCst) {
-        conn.db
-            .stats_freshness
-            .writers
-            .lock()
-            .push(Arc::downgrade(conn));
+/// A statement of `conn` is about to write `sqlite_stat1`/`sqlite_stat4` of
+/// database `db_id` (main or attached). The stats cached by that database's own
+/// connections are what goes stale, so it is tracked per [`Database`].
+pub(crate) fn note_stats_table_write(conn: &Arc<Connection>, db_id: usize) {
+    let db = conn.get_source_database(db_id);
+    {
+        let mut written = conn.stats_tables_written.lock();
+        if written.iter().any(|known| Arc::ptr_eq(known, &db)) {
+            return;
+        }
+        written.push(db.clone());
     }
+    // Not under the connection's lock: `StatsFreshness::writer_in_flight` takes
+    // the two in the opposite order.
+    db.stats_freshness.writers.lock().push(Arc::downgrade(conn));
 }
 
 /// The transaction of `conn` ended, committed or rolled back. Called once the
 /// commit is visible to other connections.
 pub(crate) fn finish_stats_table_write(conn: &Connection) {
-    if conn.stats_table_written.swap(false, Ordering::SeqCst) {
-        conn.db.stats_freshness.invalidate();
+    let written = std::mem::take(&mut *conn.stats_tables_written.lock());
+    for db in written {
+        db.stats_freshness.invalidate();
     }
 }
 
