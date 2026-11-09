@@ -347,6 +347,9 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
+    /// Set by translate paths that write `sqlite_stat1`/`sqlite_stat4` without
+    /// an `OpenWrite` on them (whole-table DELETE clears the b-tree directly).
+    writes_stats_tables: bool,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
@@ -882,6 +885,7 @@ impl ProgramBuilder {
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
+            writes_stats_tables: false,
             emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
@@ -1115,6 +1119,13 @@ impl ProgramBuilder {
     /// assigns the flag mid-translation and would clobber it.
     pub const fn may_abort(&self) -> bool {
         self.flags.may_abort() || self.emitted_function_call
+    }
+
+    /// The statement writes `sqlite_stat1`/`sqlite_stat4` through an instruction
+    /// other than `OpenWrite` (`ClearBtree`, `Destroy`), which the scan in
+    /// [`Self::build`] cannot see.
+    pub fn note_stats_table_write(&mut self) {
+        self.writes_stats_tables = true;
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -2595,18 +2606,21 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
-        let writes_stats_tables = self.insns.iter().any(|(insn, _)| match insn {
-            Insn::OpenWrite {
-                cursor_id,
-                db: crate::MAIN_DB_ID,
-                ..
-            } => match &self.cursor_ref[*cursor_id].1 {
-                CursorType::BTreeTable(table) => crate::stats::is_stats_table(&table.name),
-                CursorType::BTreeIndex(index) => crate::stats::is_stats_table(&index.table_name),
+        let writes_stats_tables = self.writes_stats_tables
+            || self.insns.iter().any(|(insn, _)| match insn {
+                Insn::OpenWrite {
+                    cursor_id,
+                    db: crate::MAIN_DB_ID,
+                    ..
+                } => match &self.cursor_ref[*cursor_id].1 {
+                    CursorType::BTreeTable(table) => crate::stats::is_stats_table(&table.name),
+                    CursorType::BTreeIndex(index) => {
+                        crate::stats::is_stats_table(&index.table_name)
+                    }
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        });
+            });
 
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
