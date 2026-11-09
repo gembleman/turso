@@ -3064,3 +3064,79 @@ async fn test_is_sole_handle_tracks_clones_statements_and_rows() {
     drop(cached);
     assert!(conn.is_sole_handle());
 }
+
+#[tokio::test]
+async fn test_is_reusable_after_transaction_ended_with_sql_commit() {
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+    assert!(conn.is_reusable());
+
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+        // Ending the transaction with SQL leaves the `Transaction` unaware of it.
+        tx.execute("COMMIT", ()).await.unwrap();
+    }
+    // Nothing is left to roll back, so the connection is reusable and the
+    // next call must not run a stale ROLLBACK.
+    assert!(conn.is_reusable());
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    drop(rows);
+    conn.execute("INSERT INTO t VALUES (2)", ()).await.unwrap();
+    assert!(conn.is_reusable());
+
+    // Same through the other entry points that handle a dangling action.
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("ROLLBACK", ()).await.unwrap();
+    }
+    conn.execute_batch("INSERT INTO t VALUES (3)")
+        .await
+        .unwrap();
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("COMMIT", ()).await.unwrap();
+    }
+    let tx = conn.transaction().await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_is_reusable_is_false_with_open_transaction_or_live_handles() {
+    let mut conn = memory_connection().await;
+    conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+        assert!(!tx.is_reusable());
+    }
+    // Dropped without finishing: the rollback is still pending.
+    assert!(!conn.is_reusable());
+    conn.execute("INSERT INTO t VALUES (2)", ()).await.unwrap();
+    assert!(conn.is_reusable());
+
+    let clone = conn.clone();
+    assert!(!conn.is_reusable());
+    drop(clone);
+    let stmt = conn.prepare("SELECT x FROM t").await.unwrap();
+    assert!(!conn.is_reusable());
+    drop(stmt);
+    assert!(conn.is_reusable());
+
+    let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
+    assert!(rows.next().await.unwrap().is_some());
+    assert!(!conn.is_reusable());
+    drop(rows);
+    assert!(conn.is_reusable());
+
+    // Only the rolled-back insert is gone.
+    let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        2
+    );
+    assert!(rows.next().await.unwrap().is_none());
+}
