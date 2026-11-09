@@ -575,6 +575,29 @@ impl Connection {
         Ok(())
     }
 
+    /// Makes statements on this connection yield to the async executor after
+    /// about every `steps` VM steps.
+    ///
+    /// Without this, a long query that never waits for I/O (for example an
+    /// aggregate over a cached table or a recursive CTE) runs inside a single
+    /// poll: it pins the executor thread, other tasks cannot run, and dropping
+    /// the future or a timeout cannot take effect until the query ends. With a
+    /// yield interval the future returns `Pending` after that many steps and
+    /// wakes itself, so the executor can run other tasks, and dropping the
+    /// future cancels the statement like it does when it waits for I/O.
+    ///
+    /// Yields happen only between VM instructions, and results are the same as
+    /// without yielding. Smaller intervals respond faster and cost more
+    /// scheduling overhead; a few thousand steps is a reasonable start. `None`
+    /// disables yielding, which is the default. The setting applies to every
+    /// statement on this connection and, like the query timeout, is not reset
+    /// by [`Connection::is_reusable`].
+    pub fn set_yield_interval(&self, steps: Option<std::num::NonZeroU64>) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.set_yield_interval(steps);
+        Ok(())
+    }
+
     /// Interrupts the statement currently running on this connection, like
     /// [`sqlite3_interrupt`](https://www.sqlite.org/c3ref/interrupt.html).
     ///
