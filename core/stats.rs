@@ -947,6 +947,20 @@ mod tests {
         assert_eq!(scans(&db), before);
     }
 
+    /// A DELETE without WHERE clears the b-tree without opening a write cursor,
+    /// and no INSERT follows to invalidate the stats.
+    #[test]
+    fn delete_all_stat1_rows_refreshes_stats_for_new_connections() {
+        let (db, writer) = analyzed_db();
+        writer.execute("DELETE FROM sqlite_stat1").unwrap();
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), None);
+        let before = scans(&db);
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), None);
+        assert_eq!(scans(&db), before);
+    }
+
     #[test]
     fn uncommitted_stat1_writes_are_picked_up_after_commit() {
         let (db, writer) = analyzed_db();
