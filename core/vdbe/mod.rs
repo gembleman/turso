@@ -3257,7 +3257,7 @@ impl Program {
             if transaction_finished {
                 // The commit (or rollback) is complete, so a connect-time
                 // stats scan sees its outcome.
-                crate::stats::finish_stats_table_write(&self.connection);
+                crate::stats::finish_stats_table_write(connection);
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit
