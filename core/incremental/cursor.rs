@@ -286,7 +286,6 @@ mod tests {
                 enable_mvcc: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
-                foreign_keys: false,
             },
             None,
             Arc::new(EngineDialect),
