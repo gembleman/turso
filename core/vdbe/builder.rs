@@ -347,9 +347,10 @@ pub struct ProgramBuilder {
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
-    /// Set by translate paths that write `sqlite_stat1`/`sqlite_stat4` without
-    /// an `OpenWrite` on them (whole-table DELETE clears the b-tree directly).
-    writes_stats_tables: bool,
+    /// Databases whose `sqlite_stat1`/`sqlite_stat4` translate paths write
+    /// without an `OpenWrite` on them (whole-table DELETE clears the b-tree
+    /// directly). `build` adds the databases it finds `OpenWrite` on them for.
+    stats_write_dbs: Vec<usize>,
     /// True once any `Insn::Function` has been emitted. See [`Self::may_abort`].
     emitted_function_call: bool,
     next_free_register: usize,
@@ -885,7 +886,7 @@ impl ProgramBuilder {
             mode: BuilderQueryMode::new(query_mode),
             reg_result_cols_start: None,
             flags: ProgramBuilderFlags::new(is_subprogram),
-            writes_stats_tables: false,
+            stats_write_dbs: Vec::new(),
             emitted_function_call: false,
             trigger,
             resolve_type: ResolveType::Abort,
@@ -1121,11 +1122,13 @@ impl ProgramBuilder {
         self.flags.may_abort() || self.emitted_function_call
     }
 
-    /// The statement writes `sqlite_stat1`/`sqlite_stat4` through an instruction
-    /// other than `OpenWrite` (`ClearBtree`, `Destroy`), which the scan in
-    /// [`Self::build`] cannot see.
-    pub fn note_stats_table_write(&mut self) {
-        self.writes_stats_tables = true;
+    /// The statement writes `sqlite_stat1`/`sqlite_stat4` of database `db`
+    /// through an instruction other than `OpenWrite` (`ClearBtree`, `Destroy`),
+    /// which the scan in [`Self::build`] cannot see.
+    pub fn note_stats_table_write(&mut self, db: usize) {
+        if !self.stats_write_dbs.contains(&db) {
+            self.stats_write_dbs.push(db);
+        }
     }
 
     pub const fn capture_data_changes_info(&self) -> &Option<CaptureDataChangesInfo> {
@@ -2606,21 +2609,20 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
-        let writes_stats_tables = self.writes_stats_tables
-            || self.insns.iter().any(|(insn, _)| match insn {
-                Insn::OpenWrite {
-                    cursor_id,
-                    db: crate::MAIN_DB_ID,
-                    ..
-                } => match &self.cursor_ref[*cursor_id].1 {
-                    CursorType::BTreeTable(table) => crate::stats::is_stats_table(&table.name),
-                    CursorType::BTreeIndex(index) => {
-                        crate::stats::is_stats_table(&index.table_name)
-                    }
-                    _ => false,
-                },
+        let mut stats_write_dbs = std::mem::take(&mut self.stats_write_dbs);
+        for (insn, _) in &self.insns {
+            let Insn::OpenWrite { cursor_id, db, .. } = insn else {
+                continue;
+            };
+            let writes_stats = match &self.cursor_ref[*cursor_id].1 {
+                CursorType::BTreeTable(table) => crate::stats::is_stats_table(&table.name),
+                CursorType::BTreeIndex(index) => crate::stats::is_stats_table(&index.table_name),
                 _ => false,
-            });
+            };
+            if writes_stats && *db != crate::TEMP_DB_ID && !stats_write_dbs.contains(db) {
+                stats_write_dbs.push(*db);
+            }
+        }
 
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
@@ -2639,7 +2641,7 @@ impl ProgramBuilder {
                 .as_bytes()
                 .get(..7)
                 .is_some_and(|head| head.eq_ignore_ascii_case(b"ANALYZE")),
-            writes_stats_tables,
+            stats_write_dbs,
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
