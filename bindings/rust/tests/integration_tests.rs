@@ -3086,3 +3086,221 @@ async fn test_is_reusable_is_false_with_open_transaction_or_live_handles() {
     );
     assert!(rows.next().await.unwrap().is_none());
 }
+
+const YIELD_TEST_COUNT: &str = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 200000) SELECT count(*) FROM c";
+
+fn yield_interval(steps: u64) -> Option<std::num::NonZeroU64> {
+    std::num::NonZeroU64::new(steps)
+}
+
+/// Spawns a task that counts how often the executor ran it. On a
+/// current-thread runtime it only advances while the test task is suspended.
+fn spawn_ticker() -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = ticks.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+    (ticks, handle)
+}
+
+async fn single_i64(conn: &turso::Connection, sql: &str) -> i64 {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_yield_interval_lets_other_tasks_run_during_a_long_query() {
+    let conn = memory_connection().await;
+
+    // Off by default: the whole query runs inside one poll and the ticker
+    // never gets the thread.
+    let (ticks, ticker) = spawn_ticker();
+    assert_eq!(single_i64(&conn, YIELD_TEST_COUNT).await, 200_000);
+    assert_eq!(ticks.load(std::sync::atomic::Ordering::Relaxed), 0);
+    ticker.abort();
+
+    conn.set_yield_interval(yield_interval(1000)).unwrap();
+    let (ticks, ticker) = spawn_ticker();
+    assert_eq!(single_i64(&conn, YIELD_TEST_COUNT).await, 200_000);
+    assert!(
+        ticks.load(std::sync::atomic::Ordering::Relaxed) > 10,
+        "the ticker must run while the query yields"
+    );
+    ticker.abort();
+
+    // Disabling it again restores the single-poll behavior.
+    conn.set_yield_interval(None).unwrap();
+    let (ticks, ticker) = spawn_ticker();
+    assert_eq!(single_i64(&conn, YIELD_TEST_COUNT).await, 200_000);
+    assert_eq!(ticks.load(std::sync::atomic::Ordering::Relaxed), 0);
+    ticker.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_yield_interval_lets_a_timeout_cancel_a_runaway_statement() {
+    let conn = memory_connection().await;
+    conn.set_yield_interval(yield_interval(1000)).unwrap();
+
+    let mut rows = conn.query(RUNAWAY_COUNT, ()).await.unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), rows.next()).await;
+    assert!(result.is_err(), "the runaway statement cannot finish");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+    // Dropping the future and the rows leaves nothing behind.
+    drop(rows);
+    assert!(conn.is_reusable());
+    assert_eq!(single_i64(&conn, "SELECT 1").await, 1);
+    assert_eq!(single_i64(&conn, YIELD_TEST_COUNT).await, 200_000);
+    assert!(conn.is_reusable());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_yield_interval_cancelled_write_statement_rolls_back() {
+    let conn = memory_connection().await;
+    let mut setup = String::from("CREATE TABLE t(x INTEGER); CREATE TABLE src(id INTEGER); BEGIN;");
+    for id in 1..=1000 {
+        setup.push_str(&format!("INSERT INTO src VALUES ({id});"));
+    }
+    setup.push_str("COMMIT;");
+    conn.execute_batch(&setup).await.unwrap();
+    conn.set_yield_interval(yield_interval(100)).unwrap();
+
+    // A three-way cross join: far too many rows to finish.
+    let mut rows = conn
+        .query("INSERT INTO t SELECT a.id FROM src a, src b, src c", ())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), rows.next()).await;
+    assert!(result.is_err(), "the runaway insert cannot finish");
+    drop(rows);
+
+    assert!(conn.is_reusable());
+    assert_eq!(single_i64(&conn, "SELECT count(*) FROM t").await, 0);
+    conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+    assert_eq!(single_i64(&conn, "SELECT count(*) FROM t").await, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_yield_interval_with_query_timeout_and_interrupt() {
+    let conn = memory_connection().await;
+    conn.set_yield_interval(yield_interval(1000)).unwrap();
+
+    // The deadline is still enforced, and other tasks run in the meantime.
+    conn.set_query_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+    let (ticks, ticker) = spawn_ticker();
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+    assert!(ticks.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    ticker.abort();
+    conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
+    assert!(conn.is_reusable());
+
+    // A task on the same thread can interrupt the statement, which it cannot
+    // do while the statement pins the thread.
+    let other = conn.clone();
+    let interrupter = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        other.interrupt().unwrap();
+    });
+    let err = first_row_error(&conn, RUNAWAY_COUNT).await;
+    assert!(matches!(err, Error::Interrupt(_)), "got {err:?}");
+    interrupter.await.unwrap();
+    assert!(conn.is_reusable());
+    assert_eq!(single_i64(&conn, "SELECT 1").await, 1);
+}
+
+async fn collect_all_rows(conn: &turso::Connection, sql: &str) -> Vec<turso::Row> {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        out.push(row);
+    }
+    out
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_yield_interval_does_not_change_results() {
+    let conn = memory_connection().await;
+    let mut setup = String::from(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER, s TEXT);
+         CREATE TABLE u(id INTEGER PRIMARY KEY, t_id INTEGER, w INTEGER);
+         BEGIN;",
+    );
+    for id in 1..=2000i64 {
+        setup.push_str(&format!(
+            "INSERT INTO t VALUES ({id}, {}, {}, 'row{id}');",
+            id % 17,
+            (id * 7919) % 1000
+        ));
+        if id % 3 == 0 {
+            setup.push_str(&format!(
+                "INSERT INTO u VALUES ({id}, {id}, {});",
+                (id * 31) % 100
+            ));
+        }
+    }
+    setup.push_str("COMMIT;");
+    conn.execute_batch(&setup).await.unwrap();
+
+    let queries = [
+        // sort
+        "SELECT id, s FROM t ORDER BY v DESC, id",
+        // group by
+        "SELECT g, count(*), sum(v), min(s), max(s) FROM t GROUP BY g ORDER BY g",
+        // join
+        "SELECT t.id, u.w FROM t JOIN u ON u.t_id = t.id WHERE u.w > 50 ORDER BY t.id, u.w",
+        // CTE
+        "WITH RECURSIVE c(x, y) AS (SELECT 1, 1 UNION ALL SELECT x + 1, (y * 3) % 1009 FROM c WHERE x < 5000) SELECT x, y FROM c WHERE y % 7 = 0",
+        // aggregate with a filter, and distinct
+        "SELECT count(*), sum(v) FROM t WHERE s LIKE 'row1%'",
+        "SELECT DISTINCT g FROM t ORDER BY g",
+    ];
+
+    let mut expected = Vec::new();
+    for sql in queries {
+        let rows = collect_all_rows(&conn, sql).await;
+        assert!(!rows.is_empty(), "{sql}");
+        expected.push(rows);
+    }
+    let expected_copy = single_i64(
+        &conn,
+        "SELECT count(*) FROM t WHERE v > 500",
+    )
+    .await;
+
+    for (n, interval) in [1u64, 7, 1000].into_iter().enumerate() {
+        conn.set_yield_interval(yield_interval(interval)).unwrap();
+        for (sql, expected) in queries.iter().zip(&expected) {
+            assert_eq!(
+                &collect_all_rows(&conn, sql).await,
+                expected,
+                "interval {interval}: {sql}"
+            );
+        }
+
+        // A write statement that yields half way through produces the same table.
+        conn.execute(&format!("CREATE TABLE copy{n}(id INTEGER PRIMARY KEY, v INTEGER)"), ())
+            .await
+            .unwrap();
+        conn.execute(
+            &format!("INSERT INTO copy{n} SELECT id, v FROM t WHERE v > 500"),
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            single_i64(&conn, &format!("SELECT count(*) FROM copy{n}")).await,
+            expected_copy
+        );
+        assert!(conn.is_reusable());
+    }
+}
