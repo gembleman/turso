@@ -1094,6 +1094,9 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// `metrics.vm_steps` (plus any work charged by `charge_yield_work`) at the
+    /// last cooperative yield; see `Connection::set_yield_interval`.
+    yield_anchor: u64,
     pub io_completions: Option<IOCompletions>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
@@ -1320,6 +1323,7 @@ impl ProgramState {
             countdown_synced: 1,
             unfinished_dispatches: 0,
             check_interval: MAX_CHECK_INTERVAL,
+            yield_anchor: 0,
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
@@ -1773,6 +1777,12 @@ impl ProgramState {
         }
     }
 
+    /// Counts `work` extra VM steps toward the cooperative yield interval, for
+    /// an instruction that does much more than one step of work.
+    pub(crate) fn charge_yield_work(&mut self, work: u64) {
+        self.yield_anchor = self.yield_anchor.wrapping_sub(work);
+    }
+
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         self.pending_counts().add_to(&mut metrics);
@@ -1789,6 +1799,7 @@ impl ProgramState {
         self.sync_step_counts();
         self.metrics.reset();
         cursor_work(&self.cursor_work).reset();
+        self.yield_anchor = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -3048,11 +3059,15 @@ impl Program {
         state.countdown_synced = state.countdown_synced.wrapping_sub(1);
         state.sync_step_counts();
         let progress_ops = connection.progress_ops();
-        state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
-            MAX_CHECK_INTERVAL
-        } else {
-            progress_ops
-        };
+        let yield_interval = connection.yield_interval();
+        let mut check_interval = MAX_CHECK_INTERVAL;
+        if progress_ops != 0 {
+            check_interval = check_interval.min(progress_ops);
+        }
+        if yield_interval != 0 {
+            check_interval = check_interval.min(yield_interval);
+        }
+        state.check_interval = check_interval;
         state.check_countdown = state.check_interval;
         state.countdown_synced = state.check_countdown;
         if connection.is_closed() {
@@ -3067,10 +3082,34 @@ impl Program {
             && !connection.is_interrupted()
             && state.query_deadline.is_none()
             && progress_ops == 0;
-        if quiet {
+        if !quiet {
+            if let Some(result) = self.periodic_interrupt_checks(state, connection, pager) {
+                return Some(result);
+            }
+        }
+        if yield_interval == 0 {
             return None;
         }
-        self.periodic_interrupt_checks(state, connection, pager)
+        Self::maybe_yield(state, yield_interval)
+    }
+
+    /// Cooperative yield (`Connection::set_yield_interval`). This runs at the
+    /// top of the dispatch loop, between two instructions: every instruction
+    /// that returned `Step` has finished, and one that has to wait is parked
+    /// with its state in `ProgramState` and re-executes at the same pc, so the
+    /// next step resumes exactly here. The interrupt, deadline and progress
+    /// checks ran first, so a yield never hides a pending cancellation.
+    #[inline(never)]
+    fn maybe_yield(state: &mut ProgramState, yield_interval: u64) -> Option<ProgramStep> {
+        // Halt is finishing the statement; its resumable work is never split.
+        if state.halt_in_progress {
+            return None;
+        }
+        if state.metrics.vm_steps.wrapping_sub(state.yield_anchor) < yield_interval {
+            return None;
+        }
+        state.yield_anchor = state.metrics.vm_steps;
+        Some(ProgramStep::Yield)
     }
 
     #[inline(never)]
