@@ -1,5 +1,6 @@
 use crate::namespace::NamespaceId;
-use crate::sync::Arc;
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{Arc, Mutex, Weak};
 use crate::types::IOResultOr;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -11,6 +12,149 @@ use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
 pub const STATS_TABLE: &str = "sqlite_stat1";
 const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
+
+/// Whether `name` is a table whose rows feed [`AnalyzeStats`] (or, for
+/// `sqlite_stat4`, would once it is consumed).
+pub(crate) fn is_stats_table(name: &str) -> bool {
+    name.eq_ignore_ascii_case(STATS_TABLE) || name.eq_ignore_ascii_case("sqlite_stat4")
+}
+
+/// What an [`AnalyzeStats`] value was loaded against. The stats are reused by
+/// a new connection only while every part of the mark still matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatsLoadMark {
+    /// [`StatsFreshness::epoch`] before the scan started.
+    epoch: u64,
+    /// Schema version of the snapshot the rows were interpreted against.
+    schema_version: u32,
+    /// WAL position `(checkpoint_seq, max_frame)` before the scan started. Only
+    /// recorded for multiprocess WAL, where another process can change
+    /// `sqlite_stat1` without this process seeing it in `epoch`.
+    wal_pos: Option<(u32, u64)>,
+}
+
+/// Database-wide bookkeeping that decides whether the stats carried by the
+/// shared schema are still what `sqlite_stat1` contains.
+///
+/// A scan is skipped on connect only if all of these hold, see
+/// [`stats_are_fresh`]:
+/// - the stats were loaded at the schema version the connection starts with
+///   (DDL and ANALYZE that creates `sqlite_stat1` bump it);
+/// - no transaction in this process wrote `sqlite_stat1`/`sqlite_stat4` since
+///   (`epoch`, bumped when such a transaction ends) and none is in flight;
+/// - for multiprocess WAL, nobody committed anything since: the pager exposes
+///   no per-table change marker, so any commit by another process counts.
+pub(crate) struct StatsFreshness {
+    epoch: AtomicU64,
+    /// Connections that wrote a stats table and have not ended that
+    /// transaction yet.
+    writers: Mutex<Vec<Weak<Connection>>>,
+    /// Number of `sqlite_stat1` scans started, for tests.
+    scans: AtomicU64,
+}
+
+impl StatsFreshness {
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            writers: Mutex::new(Vec::new()),
+            scans: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Stats loaded earlier may no longer match `sqlite_stat1`.
+    pub(crate) fn invalidate(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn scan_count(&self) -> u64 {
+        self.scans.load(Ordering::SeqCst)
+    }
+
+    /// Whether a transaction that wrote a stats table is still open. A writer
+    /// whose transaction ended without passing through
+    /// [`finish_stats_table_write`] (error paths, dropped connection) is
+    /// treated as finished and invalidates the stats.
+    fn writer_in_flight(&self) -> bool {
+        let mut writers = self.writers.lock();
+        writers.retain(|writer| match writer.upgrade() {
+            Some(conn) if conn.stats_table_written.load(Ordering::SeqCst) => {
+                if conn.get_tx_state() == TransactionState::None {
+                    conn.stats_table_written.store(false, Ordering::SeqCst);
+                    self.invalidate();
+                    false
+                } else {
+                    true
+                }
+            }
+            Some(_) => false,
+            None => {
+                self.invalidate();
+                false
+            }
+        });
+        !writers.is_empty()
+    }
+}
+
+/// A statement of `conn` is about to write `sqlite_stat1`/`sqlite_stat4` of the
+/// main database.
+pub(crate) fn note_stats_table_write(conn: &Arc<Connection>) {
+    if !conn.stats_table_written.swap(true, Ordering::SeqCst) {
+        conn.db
+            .stats_freshness
+            .writers
+            .lock()
+            .push(Arc::downgrade(conn));
+    }
+}
+
+/// The transaction of `conn` ended, committed or rolled back. Called once the
+/// commit is visible to other connections.
+pub(crate) fn finish_stats_table_write(conn: &Connection) {
+    if conn.stats_table_written.swap(false, Ordering::SeqCst) {
+        conn.db.stats_freshness.invalidate();
+    }
+}
+
+/// The WAL position other processes' commits would move, or `None` when the
+/// database cannot be shared with another process.
+fn observed_wal_pos(conn: &Connection) -> Result<Option<(u32, u64)>> {
+    if !conn.db.experimental_multiprocess_wal_enabled() {
+        return Ok(None);
+    }
+    let pager = conn.pager.load();
+    if pager.holds_read_lock() {
+        return Ok(Some(pager.wal_pos()));
+    }
+    pager.begin_read_tx()?;
+    let pos = pager.wal_pos();
+    pager.end_read_tx();
+    Ok(Some(pos))
+}
+
+/// Whether the stats the connection inherited from the shared schema are still
+/// what `sqlite_stat1` contains, so the connect-time scan can be skipped.
+fn stats_are_fresh(conn: &Connection) -> bool {
+    let (mark, schema_version) = {
+        let schema = conn.schema.read();
+        (schema.analyze_stats.loaded, schema.schema_version)
+    };
+    let Some(mark) = mark else {
+        return false;
+    };
+    let freshness = &conn.db.stats_freshness;
+    if freshness.writer_in_flight() {
+        return false;
+    }
+    mark.schema_version == schema_version
+        && mark.epoch == freshness.epoch()
+        && matches!(observed_wal_pos(conn), Ok(pos) if pos == mark.wal_pos)
+}
 
 /// Statistics produced by ANALYZE for a single index.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -56,6 +200,9 @@ impl TableStat {
 pub struct AnalyzeStats {
     /// Per-table statistics keyed by namespace and normalized table name.
     pub tables: HashMap<(NamespaceId, String), TableStat>,
+    /// Set when these stats are a complete load of `sqlite_stat1`, which is
+    /// what lets a new connection reuse them.
+    loaded: Option<StatsLoadMark>,
 }
 
 impl AnalyzeStats {
@@ -101,7 +248,7 @@ impl AnalyzeStats {
 /// `io.step()` never does; see `Database::connect_async`.
 pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
     let io = conn.db.io.clone();
-    let mut state = RefreshAnalyzeStatsState::default();
+    let mut state = RefreshAnalyzeStatsState::Connect;
     loop {
         let pending = match refresh_analyze_stats_nonblock(conn, &mut state) {
             Ok(IOResult::Done(())) => return,
@@ -129,12 +276,16 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 /// [`refresh_analyze_stats_nonblock`].
 #[derive(Default)]
 pub enum RefreshAnalyzeStatsState {
+    /// Like `Start`, but first reuses the stats the connection inherited from
+    /// the shared schema if they are still fresh. Only for a new connection.
+    Connect,
     #[default]
     Start,
     Running {
         stmt: Box<Statement>,
         schema_snapshot: Arc<Schema>,
         stats: AnalyzeStats,
+        mark: StatsLoadMark,
     },
 }
 
@@ -148,13 +299,17 @@ pub fn refresh_analyze_stats_nonblock(
 ) -> IOResultOr<()> {
     loop {
         match st {
-            RefreshAnalyzeStatsState::Start => {
+            RefreshAnalyzeStatsState::Connect | RefreshAnalyzeStatsState::Start => {
+                let reuse_fresh = matches!(st, RefreshAnalyzeStatsState::Connect);
                 if !conn.is_db_initialized() || conn.is_nested_stmt() {
                     return Ok(IOResult::Done(()));
                 }
                 if matches!(conn.get_tx_state(), TransactionState::Write { .. }) {
                     return Ok(IOResult::Done(()));
                 }
+                // Sampled before the scan: anything that commits after this
+                // point makes the mark stale instead of being missed.
+                let epoch = conn.db.stats_freshness.epoch();
                 let schema_snapshot = { conn.schema.read().clone() };
                 if schema_snapshot
                     .get_btree_table(NamespaceId::ROOT, STATS_TABLE)
@@ -162,6 +317,16 @@ pub fn refresh_analyze_stats_nonblock(
                 {
                     return Ok(IOResult::Done(()));
                 }
+                if reuse_fresh && stats_are_fresh(conn) {
+                    *st = RefreshAnalyzeStatsState::Start;
+                    return Ok(IOResult::Done(()));
+                }
+                let mark = StatsLoadMark {
+                    epoch,
+                    schema_version: schema_snapshot.schema_version,
+                    wal_pos: observed_wal_pos(conn).unwrap_or(None),
+                };
+                conn.db.stats_freshness.scans.fetch_add(1, Ordering::SeqCst);
                 let mv_tx = conn.get_mv_tx();
                 let mut stmt =
                     conn.prepare_with_origin(STATS_QUERY, StatementOrigin::EngineMetadataRead)?;
@@ -170,18 +335,21 @@ pub fn refresh_analyze_stats_nonblock(
                     stmt: Box::new(stmt),
                     schema_snapshot,
                     stats: AnalyzeStats::default(),
+                    mark,
                 };
             }
             RefreshAnalyzeStatsState::Running {
                 stmt,
                 schema_snapshot,
                 stats,
+                mark,
             } => {
                 let scan = load_sqlite_stat1_rows_nonblock(stmt, schema_snapshot, stats);
                 match scan {
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
-                        let stats = std::mem::take(stats);
+                        let mut stats = std::mem::take(stats);
+                        stats.loaded = Some(*mark);
                         if let Err(e) = install_analyze_stats(conn, stats) {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
@@ -446,12 +614,12 @@ impl StatAccum {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_stat_numbers, AnalyzeStats, NamespaceId};
+    use super::{is_stats_table, parse_stat_numbers, AnalyzeStats, NamespaceId};
     use crate::database::{ConnectOpts, Database, DatabaseOpts};
     use crate::dialect::EngineDialect;
     use crate::security::roles::SessionRole;
     use crate::sync::Arc;
-    use crate::{OpenFlags, PlatformIO, IO};
+    use crate::{Connection, MemoryIO, OpenFlags, PlatformIO, IO};
 
     #[test]
     fn parse_stat_numbers_basic() {
@@ -651,5 +819,174 @@ mod tests {
             connections.push(conn);
         }
         assert_eq!(connections.len(), 5);
+    }
+
+    #[test]
+    fn stats_table_names() {
+        assert!(is_stats_table("sqlite_stat1"));
+        assert!(is_stats_table("SQLITE_STAT4"));
+        assert!(!is_stats_table("sqlite_stat2"));
+        assert!(!is_stats_table("t"));
+    }
+
+    fn open_memory_db() -> Arc<Database> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap()
+    }
+
+    fn connect(db: &Arc<Database>) -> Arc<Connection> {
+        db.connect(ConnectOpts::new()).unwrap()
+    }
+
+    fn scans(db: &Arc<Database>) -> u64 {
+        db.stats_freshness.scan_count()
+    }
+
+    fn t_row_count(conn: &Arc<Connection>) -> Option<u64> {
+        conn.schema
+            .read()
+            .analyze_stats
+            .table_stats(NamespaceId::ROOT, "t")
+            .and_then(|stats| stats.row_count)
+    }
+
+    /// A database with an analyzed table `t` of three rows, and the connection
+    /// that analyzed it.
+    fn analyzed_db() -> (Arc<Database>, Arc<Connection>) {
+        let db = open_memory_db();
+        let writer = connect(&db);
+        writer
+            .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+            .unwrap();
+        writer.execute("CREATE INDEX t_b ON t (b)").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+            .unwrap();
+        writer.execute("ANALYZE").unwrap();
+        // The first connection after a stats-changing step may still have to
+        // load; what matters is that the ones after it do not.
+        let warm = connect(&db);
+        assert_eq!(t_row_count(&warm), Some(3));
+        (db, writer)
+    }
+
+    #[test]
+    fn stats_are_loaded_once_across_connections() {
+        let (db, _writer) = analyzed_db();
+        let before = scans(&db);
+        for _ in 0..5 {
+            let conn = connect(&db);
+            assert_eq!(t_row_count(&conn), Some(3));
+        }
+        assert_eq!(scans(&db), before, "unchanged stats must not be rescanned");
+    }
+
+    #[test]
+    fn databases_without_stats_never_scan() {
+        let db = open_memory_db();
+        let conn = connect(&db);
+        conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+        for _ in 0..3 {
+            let conn = connect(&db);
+            assert_eq!(t_row_count(&conn), None);
+        }
+        assert_eq!(scans(&db), 0);
+    }
+
+    #[test]
+    fn plain_writes_keep_stats_fresh() {
+        let (db, writer) = analyzed_db();
+        let before = scans(&db);
+        writer
+            .execute("INSERT INTO t VALUES (4, 4), (5, 5)")
+            .unwrap();
+        let conn = connect(&db);
+        // Stats describe the last ANALYZE, not the current rows.
+        assert_eq!(t_row_count(&conn), Some(3));
+        assert_eq!(scans(&db), before);
+    }
+
+    #[test]
+    fn analyze_refreshes_stats_for_new_connections() {
+        let (db, writer) = analyzed_db();
+        writer
+            .execute("INSERT INTO t VALUES (4, 4), (5, 5)")
+            .unwrap();
+        let other = connect(&db);
+        other.execute("ANALYZE").unwrap();
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(5));
+        let before = scans(&db);
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(5));
+        assert_eq!(scans(&db), before);
+    }
+
+    #[test]
+    fn direct_stat1_writes_refresh_stats_for_new_connections() {
+        let (db, writer) = analyzed_db();
+        writer.execute("DELETE FROM sqlite_stat1").unwrap();
+        writer
+            .execute("INSERT INTO sqlite_stat1 VALUES ('t', NULL, '42')")
+            .unwrap();
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(42));
+        let before = scans(&db);
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(42));
+        assert_eq!(scans(&db), before);
+    }
+
+    #[test]
+    fn uncommitted_stat1_writes_are_picked_up_after_commit() {
+        let (db, writer) = analyzed_db();
+        writer.execute("BEGIN").unwrap();
+        writer.execute("DELETE FROM sqlite_stat1").unwrap();
+        writer
+            .execute("INSERT INTO sqlite_stat1 VALUES ('t', NULL, '42')")
+            .unwrap();
+        // Connections made while the writer is open see the committed rows and
+        // must not cache them as fresh.
+        for _ in 0..2 {
+            let conn = connect(&db);
+            assert_eq!(t_row_count(&conn), Some(3));
+        }
+        writer.execute("COMMIT").unwrap();
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(42));
+    }
+
+    #[test]
+    fn rolled_back_stat1_writes_keep_old_stats() {
+        let (db, writer) = analyzed_db();
+        writer.execute("BEGIN").unwrap();
+        writer.execute("DELETE FROM sqlite_stat1").unwrap();
+        writer.execute("ROLLBACK").unwrap();
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(3));
+    }
+
+    #[test]
+    fn schema_changes_reload_stats() {
+        let (db, writer) = analyzed_db();
+        writer.execute("CREATE TABLE u (x)").unwrap();
+        let before = scans(&db);
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(3));
+        assert!(scans(&db) > before, "DDL must invalidate loaded stats");
+        let before = scans(&db);
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(3));
+        assert_eq!(scans(&db), before);
     }
 }
