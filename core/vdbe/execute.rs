@@ -20099,6 +20099,7 @@ fn op_vacuum_into_inner(
                     target_mvcc_enabled: source_db.mvcc_enabled(),
                     target_auto_vacuum_mode: source_auto_vacuum_mode,
                     copy_mvcc_metadata_table: false,
+                    commit_every: Some(crate::vdbe::vacuum::VacuumCommitBatch::VACUUM_INTO),
                 };
 
                 vacuum_state._output_db = Some(output_db);
