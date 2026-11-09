@@ -29,7 +29,10 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
+    stats::{
+        refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState,
+        StatsFreshness,
+    },
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -538,12 +541,20 @@ impl ConnectOpts {
 
 /// Resumable state for [`Database::connect_async`]. Create one per
 /// connect and pass it to every call until `IOResult::Done`.
-#[derive(Default)]
 pub struct ConnectAsyncState {
     /// The connection, once created; handed out when the stats refresh ends.
     conn: Option<Arc<Connection>>,
     /// The in-flight `sqlite_stat1` scan.
     refresh: RefreshAnalyzeStatsState,
+}
+
+impl Default for ConnectAsyncState {
+    fn default() -> Self {
+        Self {
+            conn: None,
+            refresh: RefreshAnalyzeStatsState::Connect,
+        }
+    }
 }
 
 impl ConnectAsyncState {
@@ -720,6 +731,9 @@ pub struct Database<
     dialect: Arc<dyn Dialect>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    /// Tells whether the ANALYZE stats in the shared schema can be reused by
+    /// new connections instead of rescanning `sqlite_stat1`.
+    pub(crate) stats_freshness: StatsFreshness,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
@@ -878,6 +892,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            stats_freshness: StatsFreshness::new(),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -2848,6 +2863,7 @@ impl Database {
             writes_stored_values: AtomicBool::new(false),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
+            stats_table_written: AtomicBool::new(false),
             n_active_blob_statements: AtomicI32::new(0),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),

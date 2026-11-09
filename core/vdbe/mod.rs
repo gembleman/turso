@@ -2132,6 +2132,9 @@ pub struct PreparedProgram {
     /// planner statistics. Decided once here instead of by scanning the SQL
     /// text on every completion.
     pub refreshes_analyze_stats: bool,
+    /// Opens `sqlite_stat1`/`sqlite_stat4` of the main database for writing, so
+    /// new connections must not reuse stats loaded before its transaction ends.
+    pub writes_stats_tables: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
@@ -3112,6 +3115,9 @@ impl Program {
             let transaction_finished = self.connection.auto_commit.load(Ordering::SeqCst)
                 && self.connection.get_tx_state() == TransactionState::None;
             if transaction_finished {
+                // The commit (or rollback) is complete, so a connect-time
+                // stats scan sees its outcome.
+                crate::stats::finish_stats_table_write(&self.connection);
                 // Finalize the in-memory TEMP schema only when the outer
                 // transaction actually finishes. Updating the committed temp
                 // snapshot after every statement inside an explicit
