@@ -580,6 +580,13 @@ impl Connection {
             .as_ref()
             .is_some_and(|inner| Arc::strong_count(inner) == 1)
     }
+
+    /// The counted reference to the underlying connection. Types that must keep
+    /// the connection counted until their own cleanup finished hold this as
+    /// their last field.
+    pub(crate) fn counted_handle(&self) -> Option<Arc<turso_sdk_kit::rsapi::TursoConnection>> {
+        self.inner.clone()
+    }
 }
 
 impl Debug for Connection {

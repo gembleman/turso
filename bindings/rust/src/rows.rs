@@ -3,16 +3,25 @@ use crate::{
 };
 use std::fmt::Debug;
 use std::future::Future;
+use std::sync::Arc;
 
 /// Results of a prepared statement query.
 pub struct Rows {
+    // Field order matters (fields drop in declaration order): the statement's
+    // engine cleanup first, then the operation guard, and only then the
+    // counted connection reference. This way `Connection::is_sole_handle` /
+    // `is_reusable` cannot report true while cleanup or the guard release is
+    // still running on another thread. `inner` also holds its own connection
+    // clone, but that one is released before the guard.
     inner: Statement,
     _operation_guard: Option<ConnectionOperationGuard>,
+    _connection: Option<Arc<turso_sdk_kit::rsapi::TursoConnection>>,
 }
 
 impl Rows {
     pub(crate) fn new(inner: Statement, operation_guard: Option<ConnectionOperationGuard>) -> Self {
         Self {
+            _connection: inner.conn.counted_handle(),
             inner,
             _operation_guard: operation_guard,
         }
