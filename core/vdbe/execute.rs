@@ -9729,15 +9729,18 @@ pub fn op_sorter_sort(
         },
         insn
     );
-    let (is_empty, did_sort) = {
+    let (is_empty, did_sort, sorted_records) = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
         let is_empty = cursor.is_empty();
         if !is_empty {
             return_if_io!(state, cursor.sort());
         }
-        (is_empty, !is_empty)
+        (is_empty, !is_empty, cursor.in_memory_len())
     };
+    // An in-memory sort is one instruction but does work proportional to the
+    // number of records, which a plain step count would miss.
+    state.charge_yield_work(sorted_records as u64);
     // Increment metrics for sort operation after cursor is dropped
     if did_sort {
         state.metrics.sort_operations = state.metrics.sort_operations.wrapping_add(1);
