@@ -5085,7 +5085,7 @@ mod tests {
                 "install" => {
                     output.install()?;
                     expected.retain(|path| !path.ends_with("-shm"));
-                    expected.push(log.clone());
+                    expected.push(log);
                 }
                 "discard" => {
                     output.discard(false)?;
@@ -5093,7 +5093,7 @@ mod tests {
                 }
                 _ => {
                     output.discard(true)?;
-                    expected.push(log.clone());
+                    expected.push(log);
                 }
             }
             expected.sort();
