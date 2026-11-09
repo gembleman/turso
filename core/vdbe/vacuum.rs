@@ -433,13 +433,17 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 /// the copy fail.
 ///
 /// Normally the copy is built in a temporary file beside the destination
-/// and moved over it once complete and synced. The target is committed in
+/// and moved to it once complete and synced. The target is committed in
 /// batches, so until then the file is a valid database holding only some
 /// of the rows. Built under the destination's own name, that is what a
 /// statement that fails or a process that dies partway would leave behind —
 /// and a retry would refuse the "existing" output. This way the
 /// destination path only ever holds a complete copy, as it did when the
-/// whole copy was one transaction.
+/// whole copy was one transaction. The move never replaces: should a file
+/// have appeared at the destination since `prepare` found it absent, the
+/// move fails and the statement reports an existing output file, as it
+/// does for one it finds at the start. That file is not touched, and the
+/// temporary copy is discarded.
 ///
 /// The temporary file is named for this process and this statement
 /// (`<destination>-vacuum-<pid>-<n>.tmp`), so it is never the source — a
@@ -570,13 +574,16 @@ impl VacuumIntoOutputFile {
     /// `SyncMode::Full` and closed, so the file is self-contained and synced
     /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
     /// logical log moves with it. The move is the IO's rename, so the
-    /// destination goes from absent to complete in one step, durably. The
-    /// log moves after the copy: should the process die between the two,
-    /// the destination holds a complete copy and the log is left under the
-    /// temporary name, where it troubles nothing (a log under the
-    /// destination's name beside no database would make a later non-MVCC
-    /// copy there look corrupt). Should the log fail to move, the copy is
-    /// moved back, so the destination is as it was found.
+    /// destination goes from absent to complete in one step, durably, and a
+    /// file that appeared there since `prepare` is never replaced: the
+    /// statement then fails with the error for an existing output file, and
+    /// `discard` removes the copy. The log moves after the copy: should the
+    /// process die between the two, the destination holds a complete copy
+    /// and the log is left under the temporary name, where it troubles
+    /// nothing (a log under the destination's name beside no database would
+    /// make a later non-MVCC copy there look corrupt). Should the log fail to move, the copy is
+    /// moved back, so the destination is as it was found. The log does not
+    /// replace one either.
     pub fn install(&self) -> Result<()> {
         let Some(temp_path) = &self.temp_path else {
             return Ok(());
@@ -584,7 +591,9 @@ impl VacuumIntoOutputFile {
         for sidecar in ["-wal", "-shm"] {
             remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
         }
-        self.io.rename_file(temp_path, &self.dest_path)?;
+        self.io
+            .rename_file(temp_path, &self.dest_path)
+            .map_err(|err| output_exists_or(err, &self.dest_path))?;
         let temp_log = logical_log_path(temp_path);
         if std::fs::metadata(&temp_log).is_err() {
             return Ok(());
@@ -598,9 +607,22 @@ impl VacuumIntoOutputFile {
                     self.dest_path
                 );
             }
-            return Err(err);
+            return Err(output_exists_or(err, &dest_log));
         }
         Ok(())
+    }
+}
+
+/// The error `VACUUM INTO` raises for an output file it finds at `path`,
+/// for a failed no-replace move (see [`crate::IO::rename_file`]) that found
+/// one; any other error as it is.
+fn output_exists_or(err: LimboError, path: &str) -> LimboError {
+    match err {
+        LimboError::CompletionError(crate::CompletionError::IOError(
+            std::io::ErrorKind::AlreadyExists,
+            _,
+        )) => LimboError::ParseError(format!("output file already exists: {path}")),
+        err => err,
     }
 }
 
