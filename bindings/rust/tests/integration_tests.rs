@@ -3495,3 +3495,43 @@ async fn test_builder_foreign_keys_on_for_new_connections() {
         .await
         .unwrap();
 }
+
+/// The `Database` behind a file is shared by every handle that opens it, so the
+/// foreign key default has to belong to the handle that asked for it: it must
+/// neither be lost when the file is already open nor leak into the other handle.
+#[tokio::test]
+async fn test_builder_foreign_keys_apply_when_the_file_is_already_open() {
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("foreign-keys-shared.db");
+    let db_path = db_path.to_str().expect("database path must be valid UTF-8");
+
+    let plain = Builder::new_local(db_path).build().await.unwrap();
+    let plain_conn = plain.connect().unwrap();
+    plain_conn.execute_batch(FOREIGN_KEY_SCHEMA).await.unwrap();
+
+    let strict = Builder::new_local(db_path)
+        .foreign_keys(true)
+        .build()
+        .await
+        .unwrap();
+    let strict_conn = strict.connect().unwrap();
+    let err = strict_conn
+        .execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY constraint failed"),
+        "{err}"
+    );
+
+    // The handle that did not ask for enforcement keeps the engine default.
+    plain_conn
+        .execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap();
+    let plain_other = plain.connect().unwrap();
+    plain_other
+        .execute("INSERT INTO child VALUES (2)", ())
+        .await
+        .unwrap();
+}

@@ -404,13 +404,23 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
-                // not experimental: makes `PRAGMA foreign_keys` default to ON for new connections
-                "foreign_keys" => opts.with_foreign_keys(true),
                 // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,
             };
         }
         opts
+    }
+
+    /// Whether the non-experimental feature token `"foreign_keys"` is set, which
+    /// makes `PRAGMA foreign_keys` default to ON for every connection created
+    /// from this config. It is applied per connection, not through
+    /// [`turso_core::DatabaseOpts`]: the core `Database` is shared by every
+    /// handle of the same file, so a database-wide default would be dropped
+    /// silently when the file is already open with other settings.
+    pub fn default_foreign_keys(&self) -> bool {
+        self.experimental_features
+            .as_deref()
+            .is_some_and(|features| features.split(',').any(|f| f.trim() == "foreign_keys"))
     }
 }
 
@@ -1087,8 +1097,13 @@ impl TursoDatabase {
             ));
         };
 
+        let foreign_keys = self.config.default_foreign_keys();
         let connection = if let Some(page_codec) = &self.config.page_codec {
-            db.connect(ConnectOpts::new().with_page_codec(page_codec.clone()))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_page_codec(page_codec.clone())
+                    .with_foreign_keys(foreign_keys),
+            )?
         } else {
             // Parse encryption key if configured - needed at connect time
             // which sets up encryption context before reading pages.
@@ -1097,7 +1112,11 @@ impl TursoDatabase {
             } else {
                 None
             };
-            db.connect(ConnectOpts::new().with_encryption_key(encryption_key))?
+            db.connect(
+                ConnectOpts::new()
+                    .with_encryption_key(encryption_key)
+                    .with_foreign_keys(foreign_keys),
+            )?
         };
 
         Ok(TursoConnection::new(&self.config, connection))
@@ -2263,10 +2282,14 @@ mod tests {
         assert!(opts.enable_attach);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
-        assert!(!opts.foreign_keys);
-        assert!(config_with_features(Some("foreign_keys"))
-            .database_opts()
-            .foreign_keys);
+        // "foreign_keys" is a per-connection default, not a database option.
+        assert!(!config_with_features(None).default_foreign_keys());
+        assert!(config_with_features(Some("views, foreign_keys")).default_foreign_keys());
+        assert!(!config_with_features(Some("views,foreign_keys_x")).default_foreign_keys());
+        assert_eq!(
+            config_with_features(Some("foreign_keys")).database_opts(),
+            turso_core::DatabaseOpts::new()
+        );
 
         // Whitespace is trimmed; `strict`, `generated_columns` and unknown names are ignored.
         let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
