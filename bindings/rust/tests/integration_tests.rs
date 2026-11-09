@@ -3271,11 +3271,7 @@ async fn test_yield_interval_does_not_change_results() {
         assert!(!rows.is_empty(), "{sql}");
         expected.push(rows);
     }
-    let expected_copy = single_i64(
-        &conn,
-        "SELECT count(*) FROM t WHERE v > 500",
-    )
-    .await;
+    let expected_copy = single_i64(&conn, "SELECT count(*) FROM t WHERE v > 500").await;
 
     for (n, interval) in [1u64, 7, 1000].into_iter().enumerate() {
         conn.set_yield_interval(yield_interval(interval)).unwrap();
@@ -3288,9 +3284,12 @@ async fn test_yield_interval_does_not_change_results() {
         }
 
         // A write statement that yields half way through produces the same table.
-        conn.execute(&format!("CREATE TABLE copy{n}(id INTEGER PRIMARY KEY, v INTEGER)"), ())
-            .await
-            .unwrap();
+        conn.execute(
+            &format!("CREATE TABLE copy{n}(id INTEGER PRIMARY KEY, v INTEGER)"),
+            (),
+        )
+        .await
+        .unwrap();
         conn.execute(
             &format!("INSERT INTO copy{n} SELECT id, v FROM t WHERE v > 500"),
             (),
@@ -3349,9 +3348,7 @@ async fn test_builder_foreign_keys_on_for_new_connections() {
         "{err}"
     );
 
-    conn.execute("PRAGMA foreign_keys = OFF", ())
-        .await
-        .unwrap();
+    conn.execute("PRAGMA foreign_keys = OFF", ()).await.unwrap();
     conn.execute("INSERT INTO child VALUES (1)", ())
         .await
         .unwrap();
@@ -3419,12 +3416,7 @@ async fn count_rows_in_copy(path: &std::path::Path) -> i64 {
         .expect("copy must open");
     let conn = db.connect().unwrap();
     let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
-    rows.next()
-        .await
-        .unwrap()
-        .unwrap()
-        .get::<i64>(0)
-        .unwrap()
+    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap()
 }
 
 #[tokio::test]
@@ -3457,7 +3449,8 @@ async fn test_vacuum_into_on_reused_connection_after_writes() {
     let (db, mut conn) = vacuum_into_test_db(dir.path()).await;
 
     conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
-    conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
     {
         let tx = conn.transaction().await.unwrap();
@@ -3532,7 +3525,10 @@ async fn test_vacuum_into_failure_leaves_no_output_files() {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with("out.db"))
             .collect();
-        assert!(leftovers.is_empty(), "failed VACUUM INTO left {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "failed VACUUM INTO left {leftovers:?}"
+        );
     }
     // Whether or not it timed out, a clean retry to the same path must work.
     if path.exists() {
