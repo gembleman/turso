@@ -399,3 +399,41 @@ fn wasm_opfs_cache_spill_insert_hang() {
         }
     }
 }
+
+#[test]
+fn yield_interval_yields_are_marked_cooperative() {
+    let io: Arc<dyn IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:",
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.set_yield_interval(10);
+    let mut stmt = conn
+        .prepare(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 500) \
+             SELECT count(*) FROM c",
+        )
+        .unwrap();
+    let mut yields = 0;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Yield => {
+                assert!(stmt.yielded_cooperatively());
+                yields += 1;
+            }
+            StepResult::Row => assert!(!stmt.yielded_cooperatively()),
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Sleep { .. } => io.step().unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(yields > 1, "the interval must produce yields, got {yields}");
+}

@@ -564,6 +564,7 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.state.yielded_cooperatively = false;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -1849,6 +1850,15 @@ impl Statement {
 
     pub fn is_busy(&self) -> bool {
         self.busy
+    }
+
+    /// True if the last [Self::step] returned [StepResult::Yield] only because
+    /// the connection's cooperative yield interval elapsed
+    /// ([`crate::Connection::set_yield_interval`]). Such a yield waits for
+    /// nothing, so the caller can poll again right away; any other
+    /// [StepResult::Yield] is a wait for another connection to make progress.
+    pub fn yielded_cooperatively(&self) -> bool {
+        self.state.yielded_cooperatively
     }
 
     /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
