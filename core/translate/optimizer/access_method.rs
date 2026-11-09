@@ -545,8 +545,12 @@ fn in_seek_eq_prefix(
     lhs_mask: &TableMask,
     rhs_table_idx: usize,
 ) -> SmallVec<[RangeConstraintRef; 2]> {
-    let mut prefix =
-        usable_constraints_for_lhs_mask(&rhs_constraints.constraints, refs, lhs_mask, rhs_table_idx);
+    let mut prefix = usable_constraints_for_lhs_mask(
+        &rhs_constraints.constraints,
+        refs,
+        lhs_mask,
+        rhs_table_idx,
+    );
     let len = prefix
         .iter()
         .take_while(|cref| cref.eq.as_ref().is_some_and(|eq| !eq.null_matching))
