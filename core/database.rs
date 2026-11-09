@@ -2823,6 +2823,7 @@ impl Database {
             busy_handler: RwLock::new(BusyHandler::None),
             progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
+            yield_interval_steps: AtomicU64::new(0),
             interrupt_requested: AtomicBool::new(false),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             full_column_names: AtomicBool::new(false),

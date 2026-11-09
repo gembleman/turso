@@ -547,6 +547,9 @@ pub struct Connection {
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
+    /// Cooperative yield interval in VM steps. A statement returns
+    /// `StepResult::Yield` after about this many steps. 0 means disabled.
+    pub(super) yield_interval_steps: AtomicU64,
     /// True when sqlite3_interrupt()-style cancellation is pending for active root statements.
     pub(super) interrupt_requested: AtomicBool,
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -4733,6 +4736,24 @@ impl Connection {
     /// Get the query timeout duration.
     pub fn get_query_timeout_ms(&self) -> u64 {
         self.query_timeout_ms.load(Ordering::SeqCst)
+    }
+
+    /// Makes statements on this connection return [`StepResult::Yield`] after
+    /// about every `steps` VM steps, so a caller that drives statements from an
+    /// async executor can let other tasks run, or drop the statement, during a
+    /// long query that never waits for I/O. `0` disables yielding, which is the
+    /// default.
+    ///
+    /// A yield only happens between two instructions, where the statement can
+    /// resume exactly where it stopped. A single instruction is never split, so
+    /// the granularity is one instruction.
+    pub fn set_yield_interval(&self, steps: u64) {
+        self.yield_interval_steps.store(steps, Ordering::SeqCst);
+    }
+
+    /// Cooperative yield interval in VM steps; 0 when disabled.
+    pub fn yield_interval(&self) -> u64 {
+        self.yield_interval_steps.load(Ordering::SeqCst)
     }
 
     /// Get a reference to the busy handler.
