@@ -3086,3 +3086,142 @@ async fn test_is_reusable_is_false_with_open_transaction_or_live_handles() {
     );
     assert!(rows.next().await.unwrap().is_none());
 }
+
+async fn vacuum_into_test_db(dir: &std::path::Path) -> (turso::Database, turso::Connection) {
+    let db = Builder::new_local(dir.join("source.db").to_str().unwrap())
+        .build()
+        .await
+        .expect("database must open");
+    let conn = db.connect().expect("connection must open");
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('a'), ('b'), ('c')", ())
+        .await
+        .unwrap();
+    (db, conn)
+}
+
+async fn count_rows_in_copy(path: &std::path::Path) -> i64 {
+    let db = Builder::new_local(path.to_str().unwrap())
+        .build()
+        .await
+        .expect("copy must open");
+    let conn = db.connect().unwrap();
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    rows.next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<i64>(0)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_vacuum_into_twice_on_same_connection_after_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, conn) = vacuum_into_test_db(dir.path()).await;
+
+    let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+    assert!(rows.next().await.unwrap().is_some());
+    drop(rows);
+
+    let path_a = dir.path().join("a.db");
+    let path_b = dir.path().join("b.db");
+    conn.execute(format!("VACUUM INTO '{}'", path_a.display()), ())
+        .await
+        .expect("first VACUUM INTO");
+    conn.execute(format!("VACUUM INTO '{}'", path_b.display()), ())
+        .await
+        .expect("second VACUUM INTO on the same connection");
+
+    assert_eq!(count_rows_in_copy(&path_a).await, 3);
+    assert_eq!(count_rows_in_copy(&path_b).await, 3);
+}
+
+/// The sequence of a pooled connection: schema changes and a transaction, handed
+/// back once `is_reusable()` is true, then used for a backup.
+#[tokio::test]
+async fn test_vacuum_into_on_reused_connection_after_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, mut conn) = vacuum_into_test_db(dir.path()).await;
+
+    conn.execute("PRAGMA foreign_keys = ON", ()).await.unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
+    {
+        let tx = conn.transaction().await.unwrap();
+        tx.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        tx.execute("INSERT INTO t(v) VALUES ('d')", ())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let mut cached = conn.prepare_cached("SELECT count(*) FROM t").await.unwrap();
+    let mut rows = cached.query(()).await.unwrap();
+    while rows.next().await.unwrap().is_some() {}
+    drop(rows);
+    drop(cached);
+    assert!(conn.is_reusable());
+
+    // Another connection changes the schema, so this one is stale.
+    let other = db.connect().unwrap();
+    other
+        .execute("CREATE TABLE w(id INTEGER PRIMARY KEY)", ())
+        .await
+        .unwrap();
+    other
+        .execute("INSERT INTO t(v) VALUES ('e')", ())
+        .await
+        .unwrap();
+    drop(other);
+
+    let path_a = dir.path().join("a.db");
+    let path_b = dir.path().join("b.db");
+    conn.execute(format!("VACUUM INTO '{}'", path_a.display()), ())
+        .await
+        .expect("VACUUM INTO on a reused connection");
+    conn.execute(format!("VACUUM INTO '{}'", path_b.display()), ())
+        .await
+        .expect("second VACUUM INTO on a reused connection");
+
+    assert_eq!(count_rows_in_copy(&path_a).await, 5);
+    assert_eq!(count_rows_in_copy(&path_b).await, 5);
+}
+
+#[tokio::test]
+async fn test_vacuum_into_failure_leaves_no_output_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_db, conn) = vacuum_into_test_db(dir.path()).await;
+    let tx = conn.unchecked_transaction().await.unwrap();
+    for _ in 0..12 {
+        tx.execute("INSERT INTO t(v) SELECT v || 'x' FROM t", ())
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let path = dir.path().join("out.db");
+    let wal = dir.path().join("out.db-wal");
+    conn.set_query_timeout(std::time::Duration::from_micros(200))
+        .unwrap();
+    let result = conn
+        .execute(format!("VACUUM INTO '{}'", path.display()), ())
+        .await;
+    conn.set_query_timeout(std::time::Duration::ZERO).unwrap();
+
+    if result.is_err() {
+        assert!(!path.exists(), "failed VACUUM INTO left its output file");
+        assert!(!wal.exists(), "failed VACUUM INTO left its output WAL");
+    }
+    // Whether or not it timed out, a clean retry to the same path must work.
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    conn.execute(format!("VACUUM INTO '{}'", path.display()), ())
+        .await
+        .expect("retry to the same path");
+    assert_eq!(count_rows_in_copy(&path).await, 3 * (1 << 12));
+}

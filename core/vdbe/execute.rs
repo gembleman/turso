@@ -20293,6 +20293,12 @@ pub(crate) struct VacuumIntoOpContext {
     escaped_schema_name: String,
     /// Keep output database alive while vacuum is in progress.
     _output_db: Option<Arc<Database>>,
+    /// IO and path of an output file this statement created. Removed again,
+    /// with its WAL, when the statement fails or is abandoned, so a restart
+    /// of the statement (busy retry, reprepare) or a later VACUUM INTO to the
+    /// same path starts from a clean slate instead of tripping over the
+    /// leftover ("output file already exists").
+    created_output: Option<(Arc<dyn crate::IO>, String)>,
     /// Configuration for the shared vacuum target build state machine.
     target_build_config: Option<VacuumTargetBuildConfig>,
     /// Context for the shared vacuum target build state machine.
@@ -20384,6 +20390,16 @@ fn cleanup_op_vacuum_into(
 
     vacuum_state.target_build_context = None;
     vacuum_state._output_db = None;
+    // The output database is closed now; drop the partial output it left.
+    if let Some((io, path)) = vacuum_state.created_output.take() {
+        for file in [path.clone(), format!("{path}-wal")] {
+            if std::fs::metadata(&file).is_ok() {
+                if let Err(err) = io.remove_file(&file) {
+                    tracing::warn!("VACUUM INTO could not remove partial output {file}: {err}");
+                }
+            }
+        }
+    }
 
     if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
         let pager = connection.pager.load();
@@ -20563,6 +20579,9 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                 } else {
                     (Arc::new(crate::io::PlatformIO::new()?), target.path)
                 };
+                if !output_in_memory && std::fs::metadata(&dest_path).is_err() {
+                    vacuum_state.created_output = Some((io.clone(), dest_path.clone()));
+                }
                 let page_codec = source_pager.page_codec_external();
                 let output_db = match &page_codec {
                     Some(codec) => crate::Database::open(
