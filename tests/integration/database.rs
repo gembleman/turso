@@ -834,3 +834,85 @@ impl InternalVirtualTableCursor for StaticCursor {
         self.next()
     }
 }
+
+fn open_memory_db_with_opts(opts: turso_core::DatabaseOpts) -> (Arc<dyn turso_core::IO>, Arc<Database>) {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        ":memory:",
+        OpenFlags::Create,
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    (io, db)
+}
+
+#[test]
+fn foreign_keys_are_off_by_default() {
+    let (_io, db) = open_memory_db_with_opts(turso_core::DatabaseOpts::new());
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(!conn.foreign_keys_enabled());
+    conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE child (pid INTEGER REFERENCES parent(id))")
+        .unwrap();
+    conn.execute("INSERT INTO child VALUES (1)").unwrap();
+}
+
+#[test]
+fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
+    let (_io, db) =
+        open_memory_db_with_opts(turso_core::DatabaseOpts::new().with_foreign_keys(true));
+    let setup = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    setup
+        .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE child (pid INTEGER REFERENCES parent(id))")
+        .unwrap();
+
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(conn.foreign_keys_enabled());
+    let err = conn.execute("INSERT INTO child VALUES (1)").unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY constraint failed"),
+        "{err}"
+    );
+    conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+    conn.execute("INSERT INTO child VALUES (1)").unwrap();
+
+    // The default is per connection: turning it off here leaves the others.
+    conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+    assert!(!conn.foreign_keys_enabled());
+    conn.execute("INSERT INTO child VALUES (2)").unwrap();
+    assert!(setup.execute("INSERT INTO child VALUES (3)").is_err());
+    let other = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(other.foreign_keys_enabled());
+}
+
+#[test]
+fn foreign_keys_default_on_applies_to_connect_async() {
+    let (io, db) =
+        open_memory_db_with_opts(turso_core::DatabaseOpts::new().with_foreign_keys(true));
+    let mut state = turso_core::ConnectAsyncState::new();
+    let conn = loop {
+        match db
+            .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)
+            .unwrap()
+        {
+            turso_core::IOResult::Done(conn) => break conn,
+            turso_core::IOResult::IO(completion) => completion.wait(&*io).unwrap(),
+        }
+    };
+    assert!(conn.foreign_keys_enabled());
+}
