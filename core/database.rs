@@ -29,7 +29,10 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
+    stats::{
+        refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState,
+        StatsFreshness,
+    },
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -598,7 +601,6 @@ impl ConnectOpts {
 /// connect and pass it to every call until `IOResult::Done`.
 /// Options from the first call remain in effect until completion.
 /// Resuming it on another database returns an error without consuming the state.
-#[derive(Default)]
 pub struct ConnectAsyncState {
     /// The connection, once created; handed out when the stats refresh ends.
     conn: Option<Arc<Connection>>,
@@ -607,6 +609,18 @@ pub struct ConnectAsyncState {
     opts: Option<ConnectOpts>,
     init: InitState,
     database: Option<Arc<Database>>,
+}
+
+impl Default for ConnectAsyncState {
+    fn default() -> Self {
+        Self {
+            conn: None,
+            refresh: RefreshAnalyzeStatsState::Connect,
+            opts: None,
+            init: InitState::default(),
+            database: None,
+        }
+    }
 }
 
 impl ConnectAsyncState {
@@ -804,6 +818,9 @@ pub struct Database<
     dialect: Arc<dyn Dialect>,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
+    /// Tells whether the ANALYZE stats in the shared schema can be reused by
+    /// new connections instead of rescanning `sqlite_stat1`.
+    pub(crate) stats_freshness: StatsFreshness,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
@@ -966,6 +983,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+            stats_freshness: StatsFreshness::new(),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
                 // shuttle test execution, and a shuttle-tracked atomic that
@@ -2996,6 +3014,7 @@ impl Database {
             writes_stored_values: AtomicBool::new(false),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
+            stats_table_written: AtomicBool::new(false),
             n_active_blob_statements: AtomicI32::new(0),
             n_active_read_statements: AtomicI32::new(0),
             n_active_destroy_statements: AtomicI32::new(0),
@@ -3905,6 +3924,13 @@ impl Database {
         let name = table.name.clone();
         self.with_schema_mut(|schema| schema.add_virtual_table(NamespaceId::ROOT, table))?;
         Ok(name)
+    }
+
+    /// How many times `sqlite_stat1` was scanned to refresh the stats shared
+    /// by new connections. For tests.
+    #[doc(hidden)]
+    pub fn stats_scan_count(&self) -> u64 {
+        self.stats_freshness.scan_count()
     }
 
     /// The schema that new connections start with.

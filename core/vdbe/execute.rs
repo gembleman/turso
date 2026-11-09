@@ -13644,6 +13644,9 @@ pub fn op_open_write(
     if connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
+    if program.writes_stats_tables && *db == crate::MAIN_DB_ID {
+        crate::stats::note_stats_table_write(connection);
+    }
     let pager = connection.get_pager_from_database_index(db)?;
     let mv_store = connection.mv_store_for_db(*db);
     state.cursor_databases[*cursor_id] = Some(*db);
