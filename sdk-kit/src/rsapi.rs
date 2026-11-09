@@ -1140,13 +1140,71 @@ struct CachedStatement {
     query_mode: QueryMode,
 }
 
+/// Default number of prepared statements kept per connection by
+/// [TursoConnection::prepare_cached].
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 128;
+
+/// Least-recently-used cache of prepared programs keyed by SQL text.
+///
+/// Capacity is small, so eviction scans for the oldest entry instead of
+/// maintaining an intrusive recency list.
+struct StatementCache {
+    capacity: usize,
+    /// Monotonic counter stamped on an entry each time it is used.
+    tick: u64,
+    entries: HashMap<String, (u64, Arc<CachedStatement>)>,
+}
+
+impl StatementCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, sql: &str) -> Option<Arc<CachedStatement>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (last_used, cached) = self.entries.get_mut(sql)?;
+        *last_used = tick;
+        Some(cached.clone())
+    }
+
+    fn insert(&mut self, sql: &str, cached: Arc<CachedStatement>) {
+        self.tick += 1;
+        self.entries.insert(sql.to_string(), (self.tick, cached));
+        self.evict_to_capacity();
+    }
+
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        self.evict_to_capacity();
+    }
+
+    fn evict_to_capacity(&mut self) {
+        while self.entries.len() > self.capacity {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (last_used, _))| *last_used)
+                .map(|(sql, _)| sql.clone())
+            else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
     sync_busy: Option<Arc<SyncBusyGate>>,
-    cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
+    cached_statements: Arc<Mutex<StatementCache>>,
     /// Weak refs to every statement handle created by this connection, keyed
     /// by a monotonic ID. Statements remove themselves on drop, so this map
     /// only ever contains live entries. `close()` upgrades each remaining
@@ -1170,7 +1228,9 @@ impl TursoConnection {
             connection,
             sync_busy,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
-            cached_statements: Arc::new(Mutex::new(HashMap::new())),
+            cached_statements: Arc::new(Mutex::new(StatementCache::new(
+                DEFAULT_STATEMENT_CACHE_CAPACITY,
+            ))),
             stmts: Arc::new(Mutex::new(HashMap::new())),
             next_stmt_id: Arc::new(AtomicUsize::new(0)),
         })
@@ -1361,7 +1421,18 @@ impl TursoConnection {
         }))
     }
 
+    /// Set the maximum number of statements kept by [Self::prepare_cached].
+    /// The least recently used statements are evicted first. Zero disables caching.
+    pub fn set_statement_cache_capacity(&self, capacity: usize) {
+        self.cached_statements
+            .lock()
+            .unwrap()
+            .set_capacity(capacity);
+    }
+
     /// Prepare a statement from the provided SQL string and cache it for future use.
+    /// The cache holds at most [DEFAULT_STATEMENT_CACHE_CAPACITY] statements per connection by
+    /// default, evicting the least recently used one (see [Self::set_statement_cache_capacity]).
     pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         if self.sync_operation_active() {
             return Err(sync_busy_error());
@@ -1369,7 +1440,8 @@ impl TursoConnection {
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
-        if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
+        let cached = self.cached_statements.lock().unwrap().get(sql_str);
+        if let Some(cached) = cached {
             if cached.program.is_compatible_with(&self.connection) {
                 let program = turso_core::Program::from_prepared(
                     cached.program.clone(),
@@ -1405,7 +1477,7 @@ impl TursoConnection {
         self.cached_statements
             .lock()
             .unwrap()
-            .insert(sql_str.to_string(), cached);
+            .insert(sql_str, cached);
 
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
@@ -2305,6 +2377,69 @@ mod tests {
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    #[test]
+    pub fn test_prepare_cached_is_bounded_lru() {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        let conn = db.connect().unwrap();
+
+        let select_n = |conn: &Arc<super::TursoConnection>, n: usize| {
+            let mut stmt = conn.prepare_cached(format!("SELECT {n}")).unwrap();
+            assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+            assert_eq!(stmt.row_value(0).unwrap(), Value::from_i64(n as i64));
+        };
+        let cached = |conn: &Arc<super::TursoConnection>, n: usize| {
+            conn.cached_statements
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&format!("SELECT {n}"))
+        };
+        let len = |conn: &Arc<super::TursoConnection>| {
+            conn.cached_statements.lock().unwrap().entries.len()
+        };
+
+        let capacity = super::DEFAULT_STATEMENT_CACHE_CAPACITY;
+        for n in 0..capacity * 2 {
+            select_n(&conn, n);
+            assert!(len(&conn) <= capacity);
+        }
+        assert_eq!(len(&conn), capacity);
+        assert!(!cached(&conn, 0));
+        assert!(cached(&conn, capacity * 2 - 1));
+
+        // A cache hit protects the entry from eviction; the oldest unused one goes instead.
+        let oldest = capacity;
+        select_n(&conn, oldest);
+        select_n(&conn, capacity * 2);
+        assert!(cached(&conn, oldest));
+        assert!(!cached(&conn, oldest + 1));
+        assert_eq!(len(&conn), capacity);
+
+        // Shrinking evicts down to the new capacity, keeping the most recently used.
+        conn.set_statement_cache_capacity(2);
+        assert_eq!(len(&conn), 2);
+        assert!(cached(&conn, capacity * 2));
+        assert!(cached(&conn, oldest));
+        select_n(&conn, 0);
+        assert_eq!(len(&conn), 2);
+
+        conn.set_statement_cache_capacity(0);
+        assert_eq!(len(&conn), 0);
+        select_n(&conn, 1);
+        assert_eq!(len(&conn), 0);
     }
 
     #[test]
