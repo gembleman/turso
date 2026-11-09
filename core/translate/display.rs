@@ -206,8 +206,7 @@ impl Display for SelectPlan {
                             prefix,
                             ..
                         } => {
-                            let constraint =
-                                in_seek_constraint_annotation(index, prefix.len());
+                            let constraint = in_seek_constraint_annotation(index, prefix.len());
                             let covering = if reference.utilizes_covering_index() {
                                 "COVERING "
                             } else {
