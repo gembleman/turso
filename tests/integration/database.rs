@@ -835,13 +835,13 @@ impl InternalVirtualTableCursor for StaticCursor {
     }
 }
 
-fn open_memory_db_with_opts(opts: turso_core::DatabaseOpts) -> (Arc<dyn turso_core::IO>, Arc<Database>) {
+fn open_memory_db() -> (Arc<dyn turso_core::IO>, Arc<Database>) {
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
     let db = Database::open_file_with_flags(
         io.clone(),
         ":memory:",
         OpenFlags::Create,
-        opts,
+        turso_core::DatabaseOpts::new(),
         None,
         Arc::new(SqliteDialect),
     )
@@ -851,7 +851,7 @@ fn open_memory_db_with_opts(opts: turso_core::DatabaseOpts) -> (Arc<dyn turso_co
 
 #[test]
 fn foreign_keys_are_off_by_default() {
-    let (_io, db) = open_memory_db_with_opts(turso_core::DatabaseOpts::new());
+    let (_io, db) = open_memory_db();
     let conn = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -865,8 +865,7 @@ fn foreign_keys_are_off_by_default() {
 
 #[test]
 fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
-    let (_io, db) =
-        open_memory_db_with_opts(turso_core::DatabaseOpts::new().with_foreign_keys(true));
+    let (_io, db) = open_memory_db();
     let setup = db
         .connect(ConnectOpts::new(SessionRole::Superuser))
         .unwrap();
@@ -878,7 +877,7 @@ fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
         .unwrap();
 
     let conn = db
-        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_foreign_keys(true))
         .unwrap();
     assert!(conn.foreign_keys_enabled());
     let err = conn.execute("INSERT INTO child VALUES (1)").unwrap_err();
@@ -889,25 +888,33 @@ fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
     conn.execute("INSERT INTO parent VALUES (1)").unwrap();
     conn.execute("INSERT INTO child VALUES (1)").unwrap();
 
-    // The default is per connection: turning it off here leaves the others.
+    // The default belongs to the connection that asked for it: turning it off
+    // here leaves the others alone, and connections of the same shared
+    // `Database` that did not ask for it keep the engine default.
     conn.execute("PRAGMA foreign_keys = OFF").unwrap();
     assert!(!conn.foreign_keys_enabled());
     conn.execute("INSERT INTO child VALUES (2)").unwrap();
-    assert!(setup.execute("INSERT INTO child VALUES (3)").is_err());
+    assert!(!setup.foreign_keys_enabled());
     let other = db
-        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .connect(ConnectOpts::new(SessionRole::Superuser).with_foreign_keys(true))
         .unwrap();
     assert!(other.foreign_keys_enabled());
+    let plain = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert!(!plain.foreign_keys_enabled());
 }
 
 #[test]
 fn foreign_keys_default_on_applies_to_connect_async() {
-    let (io, db) =
-        open_memory_db_with_opts(turso_core::DatabaseOpts::new().with_foreign_keys(true));
+    let (io, db) = open_memory_db();
     let mut state = turso_core::ConnectAsyncState::new();
     let conn = loop {
         match db
-            .connect_async(ConnectOpts::new(SessionRole::Superuser), &mut state)
+            .connect_async(
+                ConnectOpts::new(SessionRole::Superuser).with_foreign_keys(true),
+                &mut state,
+            )
             .unwrap()
         {
             turso_core::IOResult::Done(conn) => break conn,
