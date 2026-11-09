@@ -1097,6 +1097,10 @@ pub struct ProgramState {
     /// `metrics.vm_steps` (plus any work charged by `charge_yield_work`) at the
     /// last cooperative yield; see `Connection::set_yield_interval`.
     yield_anchor: u64,
+    /// The last `step` returned [`StepResult::Yield`] because the cooperative
+    /// yield interval elapsed, not because an instruction asked to yield (a
+    /// lock or dependency wait). Cleared at the start of every step.
+    pub(crate) yielded_cooperatively: bool,
     pub io_completions: Option<IOCompletions>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
@@ -1324,6 +1328,7 @@ impl ProgramState {
             unfinished_dispatches: 0,
             check_interval: MAX_CHECK_INTERVAL,
             yield_anchor: 0,
+            yielded_cooperatively: false,
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
@@ -3113,6 +3118,7 @@ impl Program {
             return None;
         }
         state.yield_anchor = state.metrics.vm_steps;
+        state.yielded_cooperatively = true;
         Some(ProgramStep::Yield)
     }
 
