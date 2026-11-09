@@ -11413,6 +11413,8 @@ mod tests {
             .unwrap();
 
         assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+        // A yield requested by an instruction is not the cooperative interval.
+        assert!(!stmt.yielded_cooperatively());
         assert!(injector.fired());
         assert!(matches!(stmt.step().unwrap(), StepResult::Done));
         drop(stmt);

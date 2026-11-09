@@ -483,6 +483,7 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        self.state.yielded_cooperatively = false;
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -1681,6 +1682,15 @@ impl Statement {
         self.busy
     }
 
+    /// True if the last [Self::step] returned [StepResult::Yield] only because
+    /// the connection's cooperative yield interval elapsed
+    /// ([`crate::Connection::set_yield_interval`]). Such a yield waits for
+    /// nothing, so the caller can poll again right away; any other
+    /// [StepResult::Yield] is a wait for another connection to make progress.
+    pub fn yielded_cooperatively(&self) -> bool {
+        self.state.yielded_cooperatively
+    }
+
     /// True once [Self::step] has returned a [StepResult::Row] since the last reset.
     pub fn has_returned_row(&self) -> bool {
         self.has_returned_row
@@ -1764,6 +1774,32 @@ mod tests {
     use super::*;
     use crate::EngineDialect;
     use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+
+    #[test]
+    fn yield_interval_yields_are_marked_cooperative() {
+        let conn = open_test_connection().unwrap();
+        conn.set_yield_interval(10);
+        let mut stmt = conn
+            .prepare(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 500) \
+                 SELECT count(*) FROM c",
+            )
+            .unwrap();
+        let mut yields = 0;
+        loop {
+            match stmt.step().unwrap() {
+                StepResult::Yield => {
+                    assert!(stmt.yielded_cooperatively());
+                    yields += 1;
+                }
+                StepResult::Row => assert!(!stmt.yielded_cooperatively()),
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Sleep { .. } => stmt._io().step().unwrap(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(yields > 1, "the interval must produce yields, got {yields}");
+    }
 
     #[test]
     fn cloned_halt_retains_constraint_context() {

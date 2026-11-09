@@ -1687,10 +1687,13 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
-            StepResult::Yield if async_io => {
-                // A yield waits for no completion that could wake the task, so
-                // wake it here: the caller reports `Pending` and the executor
-                // polls again after running other tasks.
+            StepResult::Yield if async_io && stmt.yielded_cooperatively() => {
+                // The cooperative yield interval elapsed. It waits for no
+                // completion that could wake the task, so wake it here: the
+                // caller reports `Pending` and the executor polls again after
+                // running other tasks. Other yields wait for another connection
+                // (an MVCC dependency, the commit lock) and are left as they
+                // were, so they do not become a busy poll loop.
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
