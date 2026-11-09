@@ -92,10 +92,6 @@ pub struct DatabaseOpts {
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
-    /// Start every connection made through [`Database::connect`] and
-    /// [`Database::connect_async`] with `PRAGMA foreign_keys` on. Off by
-    /// default, like SQLite; a connection can still turn it off.
-    pub foreign_keys: bool,
     pub(crate) enable_load_extension: bool,
 }
 
@@ -167,11 +163,6 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
-        self
-    }
-
-    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
-        self.foreign_keys = enable;
         self
     }
 }
@@ -516,6 +507,7 @@ enum StatsRefresh {
 pub struct ConnectOpts {
     encryption_key: Option<EncryptionKey>,
     page_codec: Option<Arc<dyn PageCodec>>,
+    foreign_keys: bool,
 }
 
 #[expect(
@@ -529,6 +521,7 @@ impl ConnectOpts {
         Self {
             encryption_key: None,
             page_codec: None,
+            foreign_keys: false,
         }
     }
 
@@ -544,6 +537,16 @@ impl ConnectOpts {
     /// for this connection and is not cached on the shared `Database`.
     pub fn with_page_codec(mut self, page_codec: Arc<dyn PageCodec>) -> Self {
         self.page_codec = Some(page_codec);
+        self
+    }
+
+    /// Starts the connection with `PRAGMA foreign_keys` on (set directly, no SQL
+    /// is run). Off by default, like SQLite; the connection can still turn it
+    /// off. This belongs to the connection, not to [`DatabaseOpts`]: a
+    /// [`Database`] is shared by every opener of the same file, so a database
+    /// wide default would be dropped silently whenever the file is already open.
+    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
+        self.foreign_keys = enable;
         self
     }
 }
@@ -2649,6 +2652,7 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
+        let foreign_keys = opts.foreign_keys;
         let conn = self._connect(
             false,
             None,
@@ -2657,15 +2661,15 @@ impl Database {
             context,
             StatsRefresh::Blocking,
         )?;
-        self.apply_connection_defaults(&conn);
+        Self::apply_connect_opts(&conn, foreign_keys);
         Ok(conn)
     }
 
-    /// Settings that [`DatabaseOpts`] makes the default of every connection
-    /// handed to a caller. Internal connections (open, MVCC bootstrap, vacuum)
-    /// keep the engine defaults.
-    fn apply_connection_defaults(&self, conn: &Connection) {
-        if self.opts.foreign_keys {
+    /// Settings of [`ConnectOpts`] that are applied to the new connection
+    /// itself. Internal connections (open, MVCC bootstrap, vacuum) keep the
+    /// engine defaults.
+    fn apply_connect_opts(conn: &Connection, foreign_keys: bool) {
+        if foreign_keys {
             conn.set_foreign_keys_enabled(true);
         }
     }
@@ -2700,6 +2704,7 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
+                let foreign_keys = opts.foreign_keys;
                 let conn = self._connect(
                     false,
                     None,
@@ -2708,7 +2713,7 @@ impl Database {
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
-                self.apply_connection_defaults(&conn);
+                Self::apply_connect_opts(&conn, foreign_keys);
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -5867,13 +5872,13 @@ mod database_tests {
         assert_eq!(count_test_rows(&conn), 1);
     }
 
-    fn open_memory_db(opts: DatabaseOpts) -> Arc<Database> {
+    fn open_memory_db() -> Arc<Database> {
         let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
         Database::open_file_with_flags(
             io,
             ":memory:",
             OpenFlags::Create,
-            opts,
+            DatabaseOpts::new(),
             None,
             Arc::new(EngineDialect),
         )
@@ -5882,7 +5887,7 @@ mod database_tests {
 
     #[test]
     fn foreign_keys_are_off_by_default() {
-        let db = open_memory_db(DatabaseOpts::new());
+        let db = open_memory_db();
         let conn = db.connect(ConnectOpts::new()).unwrap();
         assert!(!conn.foreign_keys_enabled());
         conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -5894,7 +5899,7 @@ mod database_tests {
 
     #[test]
     fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
-        let db = open_memory_db(DatabaseOpts::new().with_foreign_keys(true));
+        let db = open_memory_db();
         let setup = db.connect(ConnectOpts::new()).unwrap();
         setup
             .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
@@ -5903,7 +5908,9 @@ mod database_tests {
             .execute("CREATE TABLE child (pid INTEGER REFERENCES parent(id))")
             .unwrap();
 
-        let conn = db.connect(ConnectOpts::new()).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new().with_foreign_keys(true))
+            .unwrap();
         assert!(conn.foreign_keys_enabled());
         let err = conn.execute("INSERT INTO child VALUES (1)").unwrap_err();
         assert!(
@@ -5913,21 +5920,30 @@ mod database_tests {
         conn.execute("INSERT INTO parent VALUES (1)").unwrap();
         conn.execute("INSERT INTO child VALUES (1)").unwrap();
 
-        // The default is per connection: turning it off here leaves the others.
+        // The default belongs to the connection that asked for it: turning it off
+        // here leaves the others alone, and connections of the same shared
+        // `Database` that did not ask for it keep the engine default.
         conn.execute("PRAGMA foreign_keys = OFF").unwrap();
         assert!(!conn.foreign_keys_enabled());
         conn.execute("INSERT INTO child VALUES (2)").unwrap();
-        assert!(setup.execute("INSERT INTO child VALUES (3)").is_err());
-        let other = db.connect(ConnectOpts::new()).unwrap();
+        assert!(!setup.foreign_keys_enabled());
+        let other = db
+            .connect(ConnectOpts::new().with_foreign_keys(true))
+            .unwrap();
         assert!(other.foreign_keys_enabled());
+        let plain = db.connect(ConnectOpts::new()).unwrap();
+        assert!(!plain.foreign_keys_enabled());
     }
 
     #[test]
     fn foreign_keys_default_on_applies_to_connect_async() {
-        let db = open_memory_db(DatabaseOpts::new().with_foreign_keys(true));
+        let db = open_memory_db();
         let mut state = crate::ConnectAsyncState::new();
         let conn = loop {
-            match db.connect_async(ConnectOpts::new(), &mut state).unwrap() {
+            match db
+                .connect_async(ConnectOpts::new().with_foreign_keys(true), &mut state)
+                .unwrap()
+            {
                 IOResult::Done(conn) => break conn,
                 IOResult::IO(io) => io.wait(db.io.as_ref()).unwrap(),
             }
