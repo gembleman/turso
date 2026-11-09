@@ -2595,6 +2595,19 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let writes_stats_tables = self.insns.iter().any(|(insn, _)| match insn {
+            Insn::OpenWrite {
+                cursor_id,
+                db: crate::MAIN_DB_ID,
+                ..
+            } => match &self.cursor_ref[*cursor_id].1 {
+                CursorType::BTreeTable(table) => crate::stats::is_stats_table(&table.name),
+                CursorType::BTreeIndex(index) => crate::stats::is_stats_table(&index.table_name),
+                _ => false,
+            },
+            _ => false,
+        });
+
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2612,6 +2625,7 @@ impl ProgramBuilder {
                 .as_bytes()
                 .get(..7)
                 .is_some_and(|head| head.eq_ignore_ascii_case(b"ANALYZE")),
+            writes_stats_tables,
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
