@@ -416,9 +416,8 @@ fn estimate_selectivity(
                 .btree()
                 .is_some_and(|t| t.primary_key_columns.len() > 1);
             let is_pk_or_rowid_alias = is_rowid
-                || column.is_some_and(|c| {
-                    c.is_rowid_alias() || (c.primary_key() && !in_composite_pk)
-                });
+                || column
+                    .is_some_and(|c| c.is_rowid_alias() || (c.primary_key() && !in_composite_pk));
 
             let selectivity_when_unique = if row_count > 0 {
                 1.0 / row_count as f64
