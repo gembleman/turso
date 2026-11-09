@@ -540,6 +540,24 @@ impl Connection {
         conn.interrupt();
         Ok(())
     }
+
+    /// Returns `true` if this is the only live handle to the underlying
+    /// database connection.
+    ///
+    /// Clones of this `Connection`, and any [`Statement`] or [`Rows`] created
+    /// from it, share the same underlying connection and keep it alive. This
+    /// returns `false` while any of them still exists, and `true` once they
+    /// have all been dropped.
+    ///
+    /// This is intended for code that keeps connections in a pool: a
+    /// connection should only be put back in the pool when no other handle
+    /// can still use it. Also check [`Connection::is_autocommit`] to make
+    /// sure no transaction is left open.
+    pub fn is_sole_handle(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| Arc::strong_count(inner) == 1)
+    }
 }
 
 impl Debug for Connection {
