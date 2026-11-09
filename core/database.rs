@@ -92,6 +92,10 @@ pub struct DatabaseOpts {
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
+    /// Start every connection made through [`Database::connect`] and
+    /// [`Database::connect_async`] with `PRAGMA foreign_keys` on. Off by
+    /// default, like SQLite; a connection can still turn it off.
+    pub foreign_keys: bool,
     pub(crate) enable_load_extension: bool,
 }
 
@@ -163,6 +167,11 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
+        self
+    }
+
+    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
+        self.foreign_keys = enable;
         self
     }
 }
@@ -2640,14 +2649,25 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(
+        let conn = self._connect(
             false,
             None,
             opts.encryption_key,
             opts.page_codec,
             context,
             StatsRefresh::Blocking,
-        )
+        )?;
+        self.apply_connection_defaults(&conn);
+        Ok(conn)
+    }
+
+    /// Settings that [`DatabaseOpts`] makes the default of every connection
+    /// handed to a caller. Internal connections (open, MVCC bootstrap, vacuum)
+    /// keep the engine defaults.
+    fn apply_connection_defaults(&self, conn: &Connection) {
+        if self.opts.foreign_keys {
+            conn.set_foreign_keys_enabled(true);
+        }
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2688,6 +2708,7 @@ impl Database {
                     ConnectionContext::default(),
                     StatsRefresh::Deferred,
                 )?;
+                self.apply_connection_defaults(&conn);
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -5841,5 +5862,73 @@ mod database_tests {
             .connect(ConnectOpts::new().with_page_codec(codec))
             .unwrap();
         assert_eq!(count_test_rows(&conn), 1);
+    }
+
+    fn open_memory_db(opts: DatabaseOpts) -> Arc<Database> {
+        let io: Arc<dyn IO> = Arc::new(crate::MemoryIO::new());
+        Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            opts,
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn foreign_keys_are_off_by_default() {
+        let db = open_memory_db(DatabaseOpts::new());
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert!(!conn.foreign_keys_enabled());
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE child (pid INTEGER REFERENCES parent(id))")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1)").unwrap();
+    }
+
+    #[test]
+    fn foreign_keys_default_on_enforces_constraints_on_new_connections() {
+        let db = open_memory_db(DatabaseOpts::new().with_foreign_keys(true));
+        let setup = db.connect(ConnectOpts::new()).unwrap();
+        setup
+            .execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE child (pid INTEGER REFERENCES parent(id))")
+            .unwrap();
+
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        assert!(conn.foreign_keys_enabled());
+        let err = conn.execute("INSERT INTO child VALUES (1)").unwrap_err();
+        assert!(
+            err.to_string().contains("FOREIGN KEY constraint failed"),
+            "{err}"
+        );
+        conn.execute("INSERT INTO parent VALUES (1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (1)").unwrap();
+
+        // The default is per connection: turning it off here leaves the others.
+        conn.execute("PRAGMA foreign_keys = OFF").unwrap();
+        assert!(!conn.foreign_keys_enabled());
+        conn.execute("INSERT INTO child VALUES (2)").unwrap();
+        assert!(setup.execute("INSERT INTO child VALUES (3)").is_err());
+        let other = db.connect(ConnectOpts::new()).unwrap();
+        assert!(other.foreign_keys_enabled());
+    }
+
+    #[test]
+    fn foreign_keys_default_on_applies_to_connect_async() {
+        let db = open_memory_db(DatabaseOpts::new().with_foreign_keys(true));
+        let mut state = crate::ConnectAsyncState::new();
+        let conn = loop {
+            match db.connect_async(ConnectOpts::new(), &mut state).unwrap() {
+                IOResult::Done(conn) => break conn,
+                IOResult::IO(io) => io.wait(db.io.as_ref()).unwrap(),
+            }
+        };
+        assert!(conn.foreign_keys_enabled());
     }
 }
