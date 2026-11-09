@@ -4829,8 +4829,10 @@ mod tests {
     /// Two `VACUUM INTO` to one destination at the same time — here on two
     /// connections, the first stepped partway, then the second run through,
     /// then the first finished — build their copies apart: neither removes
-    /// or writes the other's, each moves a complete copy to the destination,
-    /// and nothing is left beside it.
+    /// or writes the other's. The one that finishes first moves a complete
+    /// copy to the destination; the other finds it there, is not allowed to
+    /// replace it, fails as for an existing output file, and removes its
+    /// own copy. Nothing is left beside the destination.
     #[cfg(not(target_family = "wasm"))]
     #[test]
     fn concurrent_vacuum_into_to_one_destination_build_their_copies_apart() -> Result<()> {
@@ -4902,12 +4904,25 @@ mod tests {
             "the second copy wrote into the first's WAL"
         );
 
-        while !step_first()? {}
+        // The first copy finds the second's at the destination: the move
+        // never replaces, so it fails as for an existing output file, and
+        // the second's copy stays as it is.
+        let err = loop {
+            match step_first() {
+                Ok(true) => panic!("the first copy replaced the second's"),
+                Ok(false) => {}
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            err.to_string().contains("output file already exists"),
+            "{err}"
+        );
         assert_complete_copy(dest)?;
         assert_eq!(
             temp_copies_beside(&dest_path),
             Vec::<std::path::PathBuf>::new(),
-            "a complete VACUUM INTO left files beside the destination"
+            "a failed VACUUM INTO left files beside the destination"
         );
         Ok(())
     }
@@ -4994,6 +5009,11 @@ mod tests {
                 0,
                 "the failed copy did not empty the destination again"
             );
+            // Opening the destination to check it left a WAL of its own
+            // there; the retry must start from the file as it was found.
+            for sidecar in sidecars_beside(&dest_path) {
+                std::fs::remove_file(sidecar).unwrap();
+            }
             io.lift();
             conn.execute(format!("VACUUM INTO '{dest}'"))?;
             assert_eq!(
