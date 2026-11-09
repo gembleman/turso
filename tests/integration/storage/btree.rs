@@ -322,6 +322,8 @@ fn wal_overflowing_insert_resumes_after_yield_before_balance() {
         .unwrap();
 
     assert!(matches!(stmt.step().unwrap(), StepResult::Yield));
+    // A yield requested by an instruction is not the cooperative interval.
+    assert!(!stmt.yielded_cooperatively());
     assert!(injector.fired());
     assert!(matches!(stmt.step().unwrap(), StepResult::Done));
     drop(stmt);
