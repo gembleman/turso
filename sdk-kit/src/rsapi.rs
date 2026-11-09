@@ -1143,6 +1143,11 @@ pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 128;
 ///
 /// Capacity is small, so eviction scans for the oldest entry instead of
 /// maintaining an intrusive recency list.
+///
+/// Dropping a program can run arbitrary destructors (for example of custom
+/// collation contexts), so removed entries are handed back to the caller
+/// instead of being dropped here. Callers must drop them after releasing the
+/// mutex that guards the cache.
 struct StatementCache {
     capacity: usize,
     /// Monotonic counter stamped on an entry each time it is used.
@@ -1159,26 +1164,58 @@ impl StatementCache {
         }
     }
 
-    fn get(&mut self, sql: &str) -> Option<Arc<CachedStatement>> {
+    fn next_tick(&mut self) -> u64 {
+        if self.tick == u64::MAX {
+            // Renumber entries 1..=len in recency order so stamps stay ordered.
+            let mut order: Vec<(u64, String)> = self
+                .entries
+                .iter()
+                .map(|(sql, (last_used, _))| (*last_used, sql.clone()))
+                .collect();
+            order.sort_unstable();
+            for (i, (_, sql)) in order.iter().enumerate() {
+                if let Some(entry) = self.entries.get_mut(sql) {
+                    entry.0 = i as u64 + 1;
+                }
+            }
+            self.tick = order.len() as u64;
+        }
         self.tick += 1;
-        let tick = self.tick;
+        self.tick
+    }
+
+    fn get(&mut self, sql: &str) -> Option<Arc<CachedStatement>> {
+        let tick = self.next_tick();
         let (last_used, cached) = self.entries.get_mut(sql)?;
         *last_used = tick;
         Some(cached.clone())
     }
 
-    fn insert(&mut self, sql: &str, cached: Arc<CachedStatement>) {
-        self.tick += 1;
-        self.entries.insert(sql.to_string(), (self.tick, cached));
-        self.evict_to_capacity();
+    /// Returns the entries removed by this call (a replaced entry and/or evicted
+    /// ones); drop them after unlocking the cache.
+    #[must_use]
+    fn insert(&mut self, sql: &str, cached: Arc<CachedStatement>) -> Vec<Arc<CachedStatement>> {
+        let tick = self.next_tick();
+        let mut removed: Vec<_> = self
+            .entries
+            .insert(sql.to_string(), (tick, cached))
+            .map(|(_, replaced)| replaced)
+            .into_iter()
+            .collect();
+        self.evict_to_capacity(&mut removed);
+        removed
     }
 
-    fn set_capacity(&mut self, capacity: usize) {
+    /// Returns the evicted entries; drop them after unlocking the cache.
+    #[must_use]
+    fn set_capacity(&mut self, capacity: usize) -> Vec<Arc<CachedStatement>> {
         self.capacity = capacity;
-        self.evict_to_capacity();
+        let mut removed = Vec::new();
+        self.evict_to_capacity(&mut removed);
+        removed
     }
 
-    fn evict_to_capacity(&mut self) {
+    fn evict_to_capacity(&mut self, removed: &mut Vec<Arc<CachedStatement>>) {
         while self.entries.len() > self.capacity {
             let Some(oldest) = self
                 .entries
@@ -1188,7 +1225,9 @@ impl StatementCache {
             else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if let Some((_, evicted)) = self.entries.remove(&oldest) {
+                removed.push(evicted);
+            }
         }
     }
 }
@@ -1419,10 +1458,13 @@ impl TursoConnection {
     /// Set the maximum number of statements kept by [Self::prepare_cached].
     /// The least recently used statements are evicted first. Zero disables caching.
     pub fn set_statement_cache_capacity(&self, capacity: usize) {
-        self.cached_statements
+        let evicted = self
+            .cached_statements
             .lock()
             .unwrap()
             .set_capacity(capacity);
+        // Dropped after unlocking: program destructors must not run under the lock.
+        drop(evicted);
     }
 
     /// Prepare a statement from the provided SQL string and cache it for future use.
@@ -1469,10 +1511,13 @@ impl TursoConnection {
             program: statement.get_program().prepared().clone(),
             query_mode: statement.get_query_mode(),
         });
-        self.cached_statements
+        let removed = self
+            .cached_statements
             .lock()
             .unwrap()
             .insert(sql_str, cached);
+        // Dropped after unlocking: program destructors must not run under the lock.
+        drop(removed);
 
         let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
         let stmt_id = self.track_stmt(&handle);
@@ -2435,6 +2480,100 @@ mod tests {
         assert_eq!(len(&conn), 0);
         select_n(&conn, 1);
         assert_eq!(len(&conn), 0);
+    }
+
+    fn cache_test_connection() -> Arc<super::TursoConnection> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        assert!(!db.open().unwrap().is_io());
+        db.connect().unwrap()
+    }
+
+    #[test]
+    pub fn test_prepare_cached_eviction_keeps_live_statements_working() {
+        let conn = cache_test_connection();
+        let sql = "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3";
+        let mut live = conn.prepare_cached(sql).unwrap();
+        assert_eq!(live.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(live.row_value(0).unwrap(), Value::from_i64(1));
+
+        // Evict the entry while the statement is mid-iteration, by growing past
+        // the capacity and by shrinking it.
+        conn.set_statement_cache_capacity(1);
+        conn.prepare_cached("SELECT 100").unwrap();
+        conn.prepare_cached("SELECT 101").unwrap();
+        assert!(!conn
+            .cached_statements
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(sql));
+        conn.set_statement_cache_capacity(0);
+        assert_eq!(conn.cached_statements.lock().unwrap().entries.len(), 0);
+
+        for expected in [2, 3] {
+            assert_eq!(live.step(None).unwrap(), TursoStatusCode::Row);
+            assert_eq!(live.row_value(0).unwrap(), Value::from_i64(expected));
+        }
+        assert_eq!(live.step(None).unwrap(), TursoStatusCode::Done);
+
+        // The evicted SQL can be prepared and cached again.
+        conn.set_statement_cache_capacity(4);
+        for _ in 0..2 {
+            let mut again = conn.prepare_cached(sql).unwrap();
+            assert_eq!(again.step(None).unwrap(), TursoStatusCode::Row);
+            assert_eq!(again.row_value(0).unwrap(), Value::from_i64(1));
+        }
+        assert!(conn
+            .cached_statements
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(sql));
+    }
+
+    #[test]
+    pub fn test_statement_cache_hands_back_removed_entries_and_survives_tick_overflow() {
+        let conn = cache_test_connection();
+        let entry = |sql: &str| {
+            let statement = conn.connection.prepare(sql).unwrap();
+            Arc::new(super::CachedStatement {
+                program: statement.get_program().prepared().clone(),
+                query_mode: statement.get_query_mode(),
+            })
+        };
+        let mut cache = super::StatementCache::new(2);
+        assert!(cache.insert("SELECT 1", entry("SELECT 1")).is_empty());
+        assert!(cache.insert("SELECT 2", entry("SELECT 2")).is_empty());
+        // Replacing an entry hands the old one back instead of dropping it.
+        assert_eq!(cache.insert("SELECT 2", entry("SELECT 2")).len(), 1);
+        // So does eviction (SELECT 1 is the least recently used).
+        assert_eq!(cache.insert("SELECT 3", entry("SELECT 3")).len(), 1);
+        assert!(!cache.entries.contains_key("SELECT 1"));
+        assert_eq!(cache.set_capacity(1).len(), 1);
+        assert!(cache.entries.contains_key("SELECT 3"));
+
+        // Recency order survives the tick counter running out.
+        cache.set_capacity(3).clear();
+        cache.insert("SELECT 4", entry("SELECT 4")).clear();
+        cache.insert("SELECT 5", entry("SELECT 5")).clear();
+        cache.tick = u64::MAX;
+        assert!(cache.get("SELECT 3").is_some());
+        // SELECT 3 is now the most recent, so SELECT 4 is evicted first.
+        assert_eq!(cache.insert("SELECT 6", entry("SELECT 6")).len(), 1);
+        assert!(!cache.entries.contains_key("SELECT 4"));
+        assert!(cache.entries.contains_key("SELECT 3"));
+        assert!(cache.entries.contains_key("SELECT 5"));
+        assert!(cache.tick < 100);
     }
 
     #[test]
