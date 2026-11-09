@@ -71,6 +71,7 @@ impl StatsFreshness {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     pub(crate) fn scan_count(&self) -> u64 {
         self.scans.load(Ordering::SeqCst)
     }
