@@ -13566,6 +13566,9 @@ pub fn op_destroy(
         insn
     );
     check_db_write_allowed(program, state, None)?;
+    if program.writes_stats_tables && *db == MAIN_DB_ID {
+        crate::stats::note_stats_table_write(&program.connection);
+    }
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
@@ -13614,6 +13617,11 @@ pub fn op_clear_btree(
     pager: &Arc<Pager>,
 ) -> InsnResult {
     check_db_write_allowed(program, state, None)?;
+    if program.writes_stats_tables {
+        if let Insn::ClearBtree { db: MAIN_DB_ID, .. } = insn {
+            crate::stats::note_stats_table_write(&program.connection);
+        }
+    }
     match op_clear_btree_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
