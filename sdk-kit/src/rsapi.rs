@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString},
     fmt::Display,
+    num::NonZeroU64,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -1307,6 +1308,17 @@ impl TursoConnection {
     pub fn get_query_timeout(&self) -> Duration {
         Duration::from_millis(self.connection.get_query_timeout_ms())
     }
+    /// Make statements yield to the caller after about every `steps` VM steps
+    /// (`None` disables yielding, the default). With `async_io` a yield surfaces as
+    /// [`TursoStatusCode::Io`] and the supplied waker is woken immediately.
+    pub fn set_yield_interval(&self, steps: Option<NonZeroU64>) {
+        self.connection
+            .set_yield_interval(steps.map_or(0, NonZeroU64::get));
+    }
+    /// Get the cooperative yield interval in VM steps (`None` when disabled).
+    pub fn get_yield_interval(&self) -> Option<NonZeroU64> {
+        NonZeroU64::new(self.connection.yield_interval())
+    }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
     }
@@ -1663,6 +1675,15 @@ fn step_inner(
             StepResult::Row => Ok(TursoStatusCode::Row),
             StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
             StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
+            StepResult::Yield if async_io => {
+                // A yield waits for no completion that could wake the task, so
+                // wake it here: the caller reports `Pending` and the executor
+                // polls again after running other tasks.
+                if let Some(waker) = waker {
+                    waker.wake_by_ref();
+                }
+                Ok(TursoStatusCode::Io)
+            }
             StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 if async_io {
                     Ok(TursoStatusCode::Io)
