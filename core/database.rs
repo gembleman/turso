@@ -93,6 +93,10 @@ pub struct DatabaseOpts {
     pub enable_mvcc: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
+    /// Start every connection made through [`Database::connect`] and
+    /// [`Database::connect_async`] with `PRAGMA foreign_keys` on. Off by
+    /// default, like SQLite; a connection can still turn it off.
+    pub foreign_keys: bool,
     pub(crate) enable_load_extension: bool,
 }
 
@@ -164,6 +168,11 @@ impl DatabaseOpts {
 
     pub fn with_unsafe_testing(mut self, enable: bool) -> Self {
         self.unsafe_testing = enable;
+        self
+    }
+
+    pub fn with_foreign_keys(mut self, enable: bool) -> Self {
+        self.foreign_keys = enable;
         self
     }
 }
@@ -2730,7 +2739,18 @@ impl Database {
         opts: ConnectOpts,
         context: ConnectionContext,
     ) -> Result<Arc<Connection>> {
-        self._connect(opts, context, false, None, StatsRefresh::Blocking)
+        let conn = self._connect(opts, context, false, None, StatsRefresh::Blocking)?;
+        self.apply_connection_defaults(&conn);
+        Ok(conn)
+    }
+
+    /// Settings that [`DatabaseOpts`] makes the default of every connection
+    /// handed to a caller. Internal connections (open, MVCC bootstrap, vacuum)
+    /// keep the engine defaults.
+    fn apply_connection_defaults(&self, conn: &Connection) {
+        if self.opts.foreign_keys {
+            conn.set_foreign_keys_enabled(true);
+        }
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2796,6 +2816,7 @@ impl Database {
                         Some(Arc::new(pager)),
                         StatsRefresh::Deferred,
                     )?;
+                    self.apply_connection_defaults(&conn);
                     state.conn = Some(conn.clone());
                     conn
                 }
