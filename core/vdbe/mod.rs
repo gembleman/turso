@@ -2143,9 +2143,10 @@ pub struct PreparedProgram {
     /// planner statistics. Decided once here instead of by scanning the SQL
     /// text on every completion.
     pub refreshes_analyze_stats: bool,
-    /// Opens `sqlite_stat1`/`sqlite_stat4` of the main database for writing, so
-    /// new connections must not reuse stats loaded before its transaction ends.
-    pub writes_stats_tables: bool,
+    /// Databases (main or attached) whose `sqlite_stat1`/`sqlite_stat4` the
+    /// statement writes, so connections to them must not reuse stats loaded
+    /// before its transaction ends.
+    pub stats_write_dbs: Vec<usize>,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.

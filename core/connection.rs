@@ -578,9 +578,9 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
-    /// The open transaction wrote `sqlite_stat1`/`sqlite_stat4` of the main
-    /// database; see [`crate::stats::StatsFreshness`].
-    pub(crate) stats_table_written: AtomicBool,
+    /// Databases (main or attached) whose `sqlite_stat1`/`sqlite_stat4` the open
+    /// transaction wrote; see [`crate::stats::StatsFreshness`].
+    pub(crate) stats_tables_written: Mutex<Vec<Arc<Database>>>,
     /// How many of `n_active_root_statements` are parked incremental blob
     /// handles. A blob handle keeps a Root statement open from `blob_open`
     /// until close, but between blob operations it just sits on its row, so

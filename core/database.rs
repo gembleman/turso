@@ -2885,7 +2885,7 @@ impl Database {
             writes_stored_values: AtomicBool::new(false),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
-            stats_table_written: AtomicBool::new(false),
+            stats_tables_written: Mutex::new(Vec::new()),
             n_active_blob_statements: AtomicI32::new(0),
             statement_activity: Arc::new(Mutex::new(
                 crate::connection::StatementActivity::default(),
