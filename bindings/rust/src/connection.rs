@@ -98,7 +98,26 @@ impl Connection {
         connection
     }
 
+    /// Clears a pending dangling-transaction action if the connection is
+    /// already in autocommit mode (the transaction was ended by SQL such as
+    /// `COMMIT`/`ROLLBACK` issued through the `Transaction`), since running
+    /// the action would only fail with "no transaction is active".
+    /// Returns the current autocommit state.
+    fn reconcile_dangling_tx(&self) -> Result<bool> {
+        let autocommit = self.is_autocommit()?;
+        if autocommit && self.dangling_tx.load(Ordering::SeqCst) != DropBehavior::Ignore {
+            self.dangling_tx
+                .store(DropBehavior::Ignore, Ordering::SeqCst);
+        }
+        Ok(autocommit)
+    }
+
     pub(crate) async fn maybe_handle_dangling_tx(&self) -> Result<()> {
+        if self.dangling_tx.load(Ordering::SeqCst) != DropBehavior::Ignore
+            && self.reconcile_dangling_tx()?
+        {
+            return Ok(());
+        }
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {
                 let mut stmt = self.prepare("ROLLBACK").await?;
@@ -409,6 +428,11 @@ impl Connection {
     }
 
     async fn maybe_handle_dangling_tx_without_operation_guard(&self) -> Result<()> {
+        if self.dangling_tx.load(Ordering::SeqCst) != DropBehavior::Ignore
+            && self.reconcile_dangling_tx()?
+        {
+            return Ok(());
+        }
         match self.dangling_tx.load(Ordering::SeqCst) {
             DropBehavior::Rollback => {
                 self.execute_without_operation_guard("ROLLBACK", ()).await?;
@@ -547,16 +571,37 @@ impl Connection {
     /// Clones of this `Connection`, and any [`Statement`] or [`Rows`] created
     /// from it, share the same underlying connection and keep it alive. This
     /// returns `false` while any of them still exists, and `true` once they
-    /// have all been dropped.
+    /// have all been dropped, including their engine-side cleanup and the
+    /// release of their operation guards.
     ///
-    /// This is intended for code that keeps connections in a pool: a
-    /// connection should only be put back in the pool when no other handle
-    /// can still use it. Also check [`Connection::is_autocommit`] to make
-    /// sure no transaction is left open.
+    /// This only looks at handles. Connection pools should use
+    /// [`Connection::is_reusable`], which also checks the transaction state.
     pub fn is_sole_handle(&self) -> bool {
         self.inner
             .as_ref()
             .is_some_and(|inner| Arc::strong_count(inner) == 1)
+    }
+
+    /// Returns `true` if this connection can safely be handed to another user,
+    /// for example when it is put back into a connection pool.
+    ///
+    /// This holds when
+    /// - this is the only live handle ([`Connection::is_sole_handle`]): no
+    ///   clone, [`Statement`] or [`Rows`] is left, and none is still being
+    ///   cleaned up on another thread;
+    /// - no transaction is open (autocommit mode); and
+    /// - no deferred transaction action from a dropped
+    ///   [`Transaction`](crate::transaction::Transaction) is pending. A pending
+    ///   action is cleared here if the transaction was already ended with SQL
+    ///   (`COMMIT`/`ROLLBACK`), because it would then have nothing to do.
+    ///
+    /// Per-connection settings are NOT reset: the query timeout, busy timeout,
+    /// PRAGMAs, the default transaction behavior and similar state stay as the
+    /// previous user left them. A pool must reapply the settings it relies on
+    /// before handing the connection out. Returns `false` if the state cannot
+    /// be determined.
+    pub fn is_reusable(&self) -> bool {
+        self.is_sole_handle() && matches!(self.reconcile_dangling_tx(), Ok(true))
     }
 
     /// The counted reference to the underlying connection. Types that must keep
