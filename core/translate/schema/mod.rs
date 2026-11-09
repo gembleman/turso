@@ -2089,6 +2089,9 @@ pub fn translate_drop_table(
             dependents,
         ));
     }
+    if crate::stats::is_stats_table(name) {
+        program.note_stats_table_write();
+    }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()
