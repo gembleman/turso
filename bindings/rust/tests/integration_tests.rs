@@ -3443,3 +3443,55 @@ async fn test_yield_interval_does_not_change_results() {
         assert!(conn.is_reusable());
     }
 }
+
+const FOREIGN_KEY_SCHEMA: &str = "CREATE TABLE parent (id INTEGER PRIMARY KEY); CREATE TABLE child (pid INTEGER REFERENCES parent(id));";
+
+#[tokio::test]
+async fn test_builder_foreign_keys_are_off_by_default() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(FOREIGN_KEY_SCHEMA).await.unwrap();
+    conn.execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_builder_foreign_keys_on_for_new_connections() {
+    let dir = tempfile::tempdir().expect("temporary directory must be created");
+    let db_path = dir.path().join("foreign-keys.db");
+    let db_path = db_path.to_str().expect("database path must be valid UTF-8");
+    let db = Builder::new_local(db_path)
+        .foreign_keys(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute_batch(FOREIGN_KEY_SCHEMA).await.unwrap();
+    let err = conn
+        .execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY constraint failed"),
+        "{err}"
+    );
+
+    // A fresh connection starts with enforcement on again.
+    let other = db.connect().unwrap();
+    let err = other
+        .execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("FOREIGN KEY constraint failed"),
+        "{err}"
+    );
+
+    conn.execute("PRAGMA foreign_keys = OFF", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO child VALUES (1)", ())
+        .await
+        .unwrap();
+}

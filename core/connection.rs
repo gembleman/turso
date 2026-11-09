@@ -578,6 +578,9 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    /// The open transaction wrote `sqlite_stat1`/`sqlite_stat4` of the main
+    /// database; see [`crate::stats::StatsFreshness`].
+    pub(crate) stats_table_written: AtomicBool,
     /// How many of `n_active_root_statements` are parked incremental blob
     /// handles. A blob handle keeps a Root statement open from `blob_open`
     /// until close, but between blob operations it just sits on its row, so
@@ -1378,6 +1381,9 @@ impl Connection {
     }
 
     fn force_reparse_schema_inner(self: &Arc<Connection>, publish: bool) -> Result<()> {
+        // Pages may have been replaced outside SQL, so cached stats can differ
+        // from `sqlite_stat1` at an unchanged schema version.
+        self.db.stats_freshness.invalidate();
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -2721,6 +2727,7 @@ impl Connection {
             return Err(LimboError::Busy);
         }
 
+        self.db.stats_freshness.invalidate();
         let schema = self.schema.read().clone();
         self.db.with_schema_mut(|current| {
             *current = schema.as_ref().try_clone()?;
