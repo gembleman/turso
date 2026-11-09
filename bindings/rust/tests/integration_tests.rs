@@ -3033,3 +3033,34 @@ async fn test_constraint_failure_with_its_own_conflict_resolution_is_constraint_
         }
     }
 }
+
+#[tokio::test]
+async fn test_is_sole_handle_tracks_clones_statements_and_rows() {
+    let conn = memory_connection().await;
+    conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)", ())
+        .await
+        .unwrap();
+    assert!(conn.is_sole_handle());
+
+    let clone = conn.clone();
+    assert!(!conn.is_sole_handle());
+    assert!(!clone.is_sole_handle());
+    drop(clone);
+    assert!(conn.is_sole_handle());
+
+    let mut stmt = conn.prepare("SELECT x FROM t ORDER BY x").await.unwrap();
+    assert!(!conn.is_sole_handle());
+
+    let mut rows = stmt.query(()).await.unwrap();
+    drop(stmt);
+    assert!(!conn.is_sole_handle());
+    assert!(rows.next().await.unwrap().is_some());
+    drop(rows);
+    assert!(conn.is_sole_handle());
+
+    let cached = conn.prepare_cached("SELECT x FROM t").await.unwrap();
+    assert!(!conn.is_sole_handle());
+    drop(cached);
+    assert!(conn.is_sole_handle());
+}
