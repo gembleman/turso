@@ -575,14 +575,16 @@ pub trait IO: Clock + Send + Sync {
     fn remove_file(&self, path: &str) -> Result<()>;
 
     /// Whether [`IO::rename_file`] works: the backend keeps its files on
-    /// a file system that can move a file over another in one step.
+    /// a file system that can move a file to a new name in one step.
     fn supports_rename(&self) -> bool {
         false
     }
 
-    /// Moves the file at `from` to `to`, replacing a file there, in one
-    /// step that a crash cannot leave half done, and makes the move
-    /// durable. Only when [`IO::supports_rename`] says so.
+    /// Moves the file at `from` to `to` in one step that a crash cannot
+    /// leave half done, and makes the move durable. Never replaces: when a
+    /// file is at `to`, even one that appeared an instant ago, the move
+    /// fails with an `AlreadyExists` IO error and both names are as they
+    /// were. Only when [`IO::supports_rename`] says so.
     fn rename_file(&self, _from: &str, _to: &str) -> Result<()> {
         Err(crate::LimboError::InternalError(
             "this IO cannot rename files".to_string(),
@@ -2211,11 +2213,14 @@ mod shuttle_tests {
     );
 }
 
-/// Moves the file at `from` to `to` with the platform rename, replacing a
-/// file at `to`, then syncs the directory the name lives in so the move is
-/// durable. Directories cannot be synced on Windows, and need not be.
+/// Moves the file at `from` to `to`, failing with
+/// [`std::io::ErrorKind::AlreadyExists`] when a file is at `to` — checked
+/// by the move itself, so a file that appears a moment before it is not
+/// replaced — and leaving both names as they were. Then syncs the
+/// directory the name lives in so the move is durable. Directories cannot
+/// be synced on Windows, and need not be.
 pub(crate) fn rename_file_durably(from: &str, to: &str) -> Result<()> {
-    std::fs::rename(from, to).map_err(|e| crate::error::io_error(e, "rename"))?;
+    rename_no_replace(from, to).map_err(|e| crate::error::io_error(e, "rename"))?;
     #[cfg(unix)]
     {
         let dir = std::path::Path::new(to)
@@ -2225,6 +2230,59 @@ pub(crate) fn rename_file_durably(from: &str, to: &str) -> Result<()> {
         std::fs::File::open(dir)
             .and_then(|dir| dir.sync_all())
             .map_err(|e| crate::error::io_error(e, "sync"))?;
+    }
+    Ok(())
+}
+
+/// One atomic step on Linux: `renameat2(RENAME_NOREPLACE)`. A file system
+/// or kernel that does not know the flag gets [`link_then_unlink`].
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(miri)))]
+fn rename_no_replace(from: &str, to: &str) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    use rustix::io::Errno;
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => Ok(()),
+        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => link_then_unlink(from, to),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+#[cfg(all(
+    not(windows),
+    not(all(any(target_os = "linux", target_os = "android"), not(miri)))
+))]
+fn rename_no_replace(from: &str, to: &str) -> std::io::Result<()> {
+    link_then_unlink(from, to)
+}
+
+/// A new name for the file, then the old one removed. Creating the link
+/// fails atomically when `to` exists, so nothing there is replaced. Should
+/// the old name not go, the new one is taken away again and the move has
+/// not happened.
+#[cfg(not(windows))]
+fn link_then_unlink(from: &str, to: &str) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    if let Err(err) = std::fs::remove_file(from) {
+        if let Err(undo) = std::fs::remove_file(to) {
+            tracing::warn!("could not undo linking {from} to {to} ({err}): {undo}");
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` fails when `to` exists.
+/// `MOVEFILE_WRITE_THROUGH` returns once the move is on disk.
+#[cfg(windows)]
+fn rename_no_replace(from: &str, to: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    fn wide(path: &str) -> Vec<u16> {
+        path.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both are NUL-terminated and outlive the call.
+    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
