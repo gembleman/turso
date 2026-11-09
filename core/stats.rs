@@ -81,43 +81,55 @@ impl StatsFreshness {
     /// treated as finished and invalidates the stats.
     fn writer_in_flight(&self) -> bool {
         let mut writers = self.writers.lock();
-        writers.retain(|writer| match writer.upgrade() {
-            Some(conn) if conn.stats_table_written.load(Ordering::SeqCst) => {
-                if conn.get_tx_state() == TransactionState::None {
-                    conn.stats_table_written.store(false, Ordering::SeqCst);
-                    self.invalidate();
-                    false
-                } else {
-                    true
-                }
-            }
-            Some(_) => false,
-            None => {
+        writers.retain(|writer| {
+            let Some(conn) = writer.upgrade() else {
+                self.invalidate();
+                return false;
+            };
+            let mut written = conn.stats_tables_written.lock();
+            // The connection wrote this database's stats tables only while
+            // its entry is in the list; finishing the write removes it.
+            let Some(pos) = written
+                .iter()
+                .position(|db| std::ptr::eq(&db.stats_freshness, self))
+            else {
+                return false;
+            };
+            if conn.get_tx_state() == TransactionState::None {
+                written.remove(pos);
                 self.invalidate();
                 false
+            } else {
+                true
             }
         });
         !writers.is_empty()
     }
 }
 
-/// A statement of `conn` is about to write `sqlite_stat1`/`sqlite_stat4` of the
-/// main database.
-pub(crate) fn note_stats_table_write(conn: &Arc<Connection>) {
-    if !conn.stats_table_written.swap(true, Ordering::SeqCst) {
-        conn.db
-            .stats_freshness
-            .writers
-            .lock()
-            .push(Arc::downgrade(conn));
+/// A statement of `conn` is about to write `sqlite_stat1`/`sqlite_stat4` of
+/// database `db_id` (main or attached). The stats cached by that database's own
+/// connections are what goes stale, so it is tracked per [`Database`].
+pub(crate) fn note_stats_table_write(conn: &Arc<Connection>, db_id: usize) {
+    let db = conn.get_source_database(db_id);
+    {
+        let mut written = conn.stats_tables_written.lock();
+        if written.iter().any(|known| Arc::ptr_eq(known, &db)) {
+            return;
+        }
+        written.push(db.clone());
     }
+    // Not under the connection's lock: `StatsFreshness::writer_in_flight` takes
+    // the two in the opposite order.
+    db.stats_freshness.writers.lock().push(Arc::downgrade(conn));
 }
 
 /// The transaction of `conn` ended, committed or rolled back. Called once the
 /// commit is visible to other connections.
 pub(crate) fn finish_stats_table_write(conn: &Connection) {
-    if conn.stats_table_written.swap(false, Ordering::SeqCst) {
-        conn.db.stats_freshness.invalidate();
+    let written = std::mem::take(&mut *conn.stats_tables_written.lock());
+    for db in written {
+        db.stats_freshness.invalidate();
     }
 }
 
@@ -940,6 +952,83 @@ mod tests {
         let conn = connect(&db);
         assert_eq!(t_row_count(&conn), None);
         assert_eq!(scans(&db), before);
+    }
+
+    /// An analyzed file database `aux.db` (kept open by the returned handles),
+    /// and a separate in-memory connection with it attached as `aux`.
+    fn attached_analyzed_db(
+        dir: &std::path::Path,
+    ) -> (Arc<Database>, Arc<Connection>, Arc<Connection>) {
+        let aux_path = dir.join("aux.db");
+        let aux_path = aux_path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let aux_db = Database::open_file_with_flags(
+            io,
+            aux_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let direct = connect(&aux_db);
+        direct
+            .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+            .unwrap();
+        direct.execute("CREATE INDEX t_b ON t (b)").unwrap();
+        direct
+            .execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+            .unwrap();
+        direct.execute("ANALYZE").unwrap();
+        assert_eq!(t_row_count(&connect(&aux_db)), Some(3));
+
+        let main_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main_db = Database::open_file_with_flags(
+            main_io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_attach(true),
+            None,
+            Arc::new(EngineDialect),
+        )
+        .unwrap();
+        let main = connect(&main_db);
+        main.execute(format!("ATTACH '{aux_path}' AS aux")).unwrap();
+        (aux_db, direct, main)
+    }
+
+    #[test]
+    fn attached_stat1_writes_refresh_stats_for_the_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+        let before = scans(&aux_db);
+        main.execute("DELETE FROM aux.sqlite_stat1 WHERE tbl = 't'")
+            .unwrap();
+        let conn = connect(&aux_db);
+        assert_eq!(t_row_count(&conn), None);
+        assert!(scans(&aux_db) > before, "the write must invalidate aux.db");
+    }
+
+    #[test]
+    fn attached_delete_all_stat1_rows_refreshes_stats_for_the_attached_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+        main.execute("DELETE FROM aux.sqlite_stat1").unwrap();
+        let conn = connect(&aux_db);
+        assert_eq!(t_row_count(&conn), None);
+    }
+
+    #[test]
+    fn attached_uncommitted_stat1_writes_are_not_cached_as_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (aux_db, _direct, main) = attached_analyzed_db(dir.path());
+        main.execute("BEGIN").unwrap();
+        main.execute("DELETE FROM aux.sqlite_stat1").unwrap();
+        for _ in 0..2 {
+            assert_eq!(t_row_count(&connect(&aux_db)), Some(3));
+        }
+        main.execute("COMMIT").unwrap();
+        assert_eq!(t_row_count(&connect(&aux_db)), None);
     }
 
     #[test]

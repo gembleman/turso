@@ -2234,7 +2234,7 @@ pub fn translate_drop_table(
     };
     validate_drop_table(&resolver.catalog, namespace, name, connection)?;
     if crate::stats::is_stats_table(name) {
-        program.note_stats_table_write();
+        program.note_stats_table_write(database_id);
     }
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
