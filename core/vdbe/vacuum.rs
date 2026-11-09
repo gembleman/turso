@@ -457,11 +457,26 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 /// truncated back to the empty file it was. A process killed partway cannot
 /// do that: it leaves an empty database (a header page, no schema, no rows)
 /// that a retry refuses until the file is removed or emptied, as before.
+///
+/// Opening the destination also creates files beside it: its WAL and, when
+/// the engine uses them, its shm, multiprocess coordination file and MVCC
+/// logical log. `prepare` notes which of them were absent; those are
+/// removed again when the copy fails, and, but for the log, which belongs to
+/// an MVCC copy, when it succeeds. A file that was there is never removed:
+/// the destination may be attached on this connection, which keeps them. The
+/// residual is a process that opens the destination while the copy is built
+/// and creates one of these files in that time: it is removed with the
+/// rest, and that process's database with it.
 pub(crate) struct VacuumIntoOutputFile {
     io: Arc<dyn crate::IO>,
     dest_path: String,
     /// The temporary copy; None when the copy is built at the destination.
     temp_path: Option<String>,
+    /// For a copy built at the destination: the files the engine keeps
+    /// beside a database ([`Self::sidecars`] of the destination) that were
+    /// absent when the statement began, so are ones it creates. Empty for a
+    /// temporary copy, which `temp_files` covers.
+    absent_sidecars: Vec<String>,
 }
 
 impl VacuumIntoOutputFile {
@@ -474,10 +489,15 @@ impl VacuumIntoOutputFile {
     /// already exists or `io` cannot move a temporary file over it.
     pub fn prepare(io: Arc<dyn crate::IO>, dest_path: &str) -> Result<Self> {
         if !io.supports_rename() || std::fs::metadata(dest_path).is_ok() {
+            let absent_sidecars = Self::sidecars(dest_path)
+                .into_iter()
+                .filter(|path| std::fs::metadata(path).is_err())
+                .collect();
             return Ok(Self {
                 io,
                 dest_path: dest_path.to_string(),
                 temp_path: None,
+                absent_sidecars,
             });
         }
         static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -488,6 +508,7 @@ impl VacuumIntoOutputFile {
                 io: io.clone(),
                 dest_path: dest_path.to_string(),
                 temp_path: Some(format!("{dest_path}-vacuum-{pid}-{seq}.tmp")),
+                absent_sidecars: Vec::new(),
             };
             if this
                 .temp_files()
@@ -514,19 +535,46 @@ impl VacuumIntoOutputFile {
         self.temp_path.is_some()
     }
 
-    /// The temporary copy and the files the engine keeps beside a database:
-    /// its WAL, shm and MVCC logical log. Nothing for a copy built at the
-    /// destination.
+    /// The files the engine keeps beside the database at `db_path`: its
+    /// WAL, shm, multiprocess WAL coordination file (`-tshm`, see
+    /// `coordination_path_for_wal_path`, which exists only on some targets)
+    /// and MVCC logical log.
+    fn sidecars(db_path: &str) -> Vec<String> {
+        vec![
+            format!("{db_path}-wal"),
+            format!("{db_path}-shm"),
+            format!("{db_path}-tshm"),
+            logical_log_path(db_path),
+        ]
+    }
+
+    /// The temporary copy and the files the engine keeps beside a database.
+    /// Nothing for a copy built at the destination.
     fn temp_files(&self) -> Vec<String> {
         let Some(temp_path) = &self.temp_path else {
             return Vec::new();
         };
-        vec![
-            temp_path.clone(),
-            format!("{temp_path}-wal"),
-            format!("{temp_path}-shm"),
-            logical_log_path(temp_path),
-        ]
+        let mut files = vec![temp_path.clone()];
+        files.extend(Self::sidecars(temp_path));
+        files
+    }
+
+    /// Removes the files the copy built at the destination created beside
+    /// it — those that were absent in `prepare` — except the MVCC logical
+    /// log when `keep_log`. Every one is tried; the first error is returned.
+    fn remove_created_sidecars(&self, keep_log: bool) -> Result<()> {
+        let log = logical_log_path(&self.dest_path);
+        let mut first_error = Ok(());
+        for path in &self.absent_sidecars {
+            if keep_log && *path == log {
+                continue;
+            }
+            let removed = remove_file_if_exists(&*self.io, path);
+            if first_error.is_ok() {
+                first_error = removed;
+            }
+        }
+        first_error
     }
 
     /// Leaves the destination as it was found after the copy failed: the
@@ -535,7 +583,10 @@ impl VacuumIntoOutputFile {
     /// was built at is truncated back to the empty file it was, unless the
     /// copy's transaction `committed` and only what came after (its
     /// checkpoint) failed: then the whole copy is in that destination's
-    /// WAL, and the file is left as it is, header page and all, as before.
+    /// WAL, and the file is left as it is, header page and all, as before,
+    /// with the WAL and everything else beside it. After a truncation the
+    /// files the copy created beside the destination — WAL, shm, MVCC
+    /// logical log — are removed, but never one that was there before.
     /// The output database must be closed first.
     pub fn discard(&self, committed: bool) -> Result<()> {
         if self.temp_path.is_none() {
@@ -548,7 +599,8 @@ impl VacuumIntoOutputFile {
             let truncated = file.truncate(0, Completion::new_trunc(|_| {}))?;
             self.io.wait_for_completion(truncated)?;
             let synced = file.sync(Completion::new_sync(|_| {}), crate::io::FileSyncType::Fsync)?;
-            return self.io.wait_for_completion(synced);
+            self.io.wait_for_completion(synced)?;
+            return self.remove_created_sidecars(false);
         }
         for path in self.temp_files() {
             remove_file_if_exists(&*self.io, &path)?;
@@ -557,25 +609,38 @@ impl VacuumIntoOutputFile {
     }
 
     /// Moves a finished temporary copy to the destination; a copy built at
-    /// the destination is there already. The copy was checkpointed under
-    /// `SyncMode::Full` and closed, so the file is self-contained and synced
-    /// and its WAL is empty; the WAL and shm are dropped and an MVCC copy's
-    /// logical log moves with it. The move is the IO's rename, so the
-    /// destination goes from absent to complete in one step, durably, and a
-    /// file that appeared there since `prepare` is never replaced: the
-    /// statement then fails with the error for an existing output file, and
-    /// `discard` removes the copy. The log moves after the copy: should the
-    /// process die between the two, the destination holds a complete copy
-    /// and the log is left under the temporary name, where it troubles
-    /// nothing (a log under the destination's name beside no database would
-    /// make a later non-MVCC copy there look corrupt). Should the log fail to move, the copy is
+    /// the destination is there already, and only the WAL, shm and
+    /// coordination files it created beside it are removed — its WAL is
+    /// empty, as below — not the MVCC logical log, which belongs to an MVCC
+    /// copy, nor a file that was there before. Those are removed on a best
+    /// effort, a failure only logged: the copy is complete, and `discard`
+    /// would empty it.
+    ///
+    /// A temporary copy was checkpointed under `SyncMode::Full` and closed,
+    /// so the file is self-contained and synced and its WAL is empty; the
+    /// WAL and shm are dropped and an MVCC copy's logical log moves with it.
+    /// The move is the IO's rename, so the destination goes from absent to
+    /// complete in one step, durably, and a file that appeared there since
+    /// `prepare` is never replaced: the statement then fails with the error
+    /// for an existing output file, and `discard` removes the copy. The log
+    /// moves after the copy: should the process die between the two, the
+    /// destination holds a complete copy and the log is left under the
+    /// temporary name, where it troubles nothing (a log under the
+    /// destination's name beside no database would make a later non-MVCC
+    /// copy there look corrupt). Should the log fail to move, the copy is
     /// moved back, so the destination is as it was found. The log does not
     /// replace one either.
     pub fn install(&self) -> Result<()> {
         let Some(temp_path) = &self.temp_path else {
+            if let Err(err) = self.remove_created_sidecars(true) {
+                tracing::warn!(
+                    "VACUUM INTO could not remove the files its copy created beside {}: {err}",
+                    self.dest_path
+                );
+            }
             return Ok(());
         };
-        for sidecar in ["-wal", "-shm"] {
+        for sidecar in ["-wal", "-shm", "-tshm"] {
             remove_file_if_exists(&*self.io, &format!("{temp_path}{sidecar}"))?;
         }
         self.io
@@ -4432,6 +4497,17 @@ mod tests {
         files
     }
 
+    /// The files the engine keeps beside the database at `dest_path` that
+    /// exist now: WAL, shm, coordination file and MVCC logical log.
+    fn sidecars_beside(dest_path: &std::path::Path) -> Vec<String> {
+        let mut files: Vec<String> = VacuumIntoOutputFile::sidecars(dest_path.to_str().unwrap())
+            .into_iter()
+            .filter(|path| std::fs::metadata(path).is_ok())
+            .collect();
+        files.sort();
+        files
+    }
+
     /// A `VACUUM INTO` that fails partway, after at least one batch of the
     /// copy was committed, must leave no copy at the destination — the whole
     /// copy or nothing, as when it was one transaction and as SQLite — and a
@@ -4878,6 +4954,14 @@ mod tests {
             dest_path.exists(),
             "the destination the copy was built at is gone"
         );
+        if !killed {
+            // A killed process runs no cleanup, so its files stay.
+            assert_eq!(
+                sidecars_beside(&dest_path),
+                Vec::<String>::new(),
+                "the failed copy left WAL, shm or log files beside the destination"
+            );
+        }
         assert_empty_database(dest)?;
 
         if killed {
@@ -4912,6 +4996,11 @@ mod tests {
             );
             io.lift();
             conn.execute(format!("VACUUM INTO '{dest}'"))?;
+            assert_eq!(
+                sidecars_beside(&dest_path),
+                Vec::<String>::new(),
+                "the retry left WAL, shm or log files beside the destination"
+            );
         }
         assert_complete_copy(dest)?;
         assert_eq!(
@@ -4919,6 +5008,102 @@ mod tests {
             Vec::<std::path::PathBuf>::new(),
             "the retry left files beside the destination"
         );
+        Ok(())
+    }
+
+    /// A copy built at the destination that succeeds leaves no WAL or shm
+    /// there that it created: the copy is checkpointed into the file.
+    #[cfg(not(target_family = "wasm"))]
+    fn vacuum_into_built_at_the_destination_leaves_no_new_sidecars(
+        rename: bool,
+        existing_destination: bool,
+    ) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.db");
+        let dest_path = dir.path().join("copy.db");
+        let dest = dest_path.to_str().unwrap();
+        if existing_destination {
+            std::fs::File::create(&dest_path).unwrap();
+        }
+        let io = FailingWritesIo::with_rename(dest, u64::MAX, false, rename)?;
+        let (_db, conn) = open_file_db(io, source_path.to_str().unwrap())?;
+        create_atomicity_fixture(&conn)?;
+
+        conn.execute(format!("VACUUM INTO '{dest}'"))?;
+        assert_eq!(
+            sidecars_beside(&dest_path),
+            Vec::<String>::new(),
+            "VACUUM INTO left WAL or shm files beside the destination"
+        );
+        assert_complete_copy(dest)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_on_an_io_without_rename_leaves_no_new_sidecars() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_no_new_sidecars(false, false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_an_existing_empty_destination_leaves_no_new_sidecars() -> Result<()> {
+        vacuum_into_built_at_the_destination_leaves_no_new_sidecars(true, true)
+    }
+
+    /// A copy built at the destination removes the files it created beside
+    /// it and only those: one that was there before — the destination may
+    /// be attached on this connection — stays, whether the copy is
+    /// installed, discarded after a failure, or discarded after its
+    /// transaction committed (which removes nothing). The MVCC logical log
+    /// is kept by `install`, which leaves it to the copy it belongs to.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_into_at_the_destination_never_removes_a_sidecar_that_was_there() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        for step in ["install", "discard", "discard after commit"] {
+            let dir = tempfile::tempdir().unwrap();
+            let dest_path = dir.path().join("copy.db");
+            let dest = dest_path.to_str().unwrap();
+            let log = logical_log_path(dest);
+            std::fs::File::create(&dest_path).unwrap();
+            // The destination's WAL and coordination file were there.
+            std::fs::write(format!("{dest}-wal"), b"theirs").unwrap();
+            std::fs::write(format!("{dest}-tshm"), b"theirs").unwrap();
+
+            let output = VacuumIntoOutputFile::prepare(io.clone(), dest)?;
+            assert!(!output.is_temporary());
+            // The copy creates the rest.
+            std::fs::write(format!("{dest}-shm"), b"ours").unwrap();
+            std::fs::write(&log, b"ours").unwrap();
+
+            let mut expected = vec![
+                format!("{dest}-shm"),
+                format!("{dest}-tshm"),
+                format!("{dest}-wal"),
+            ];
+            match step {
+                "install" => {
+                    output.install()?;
+                    expected.retain(|path| !path.ends_with("-shm"));
+                    expected.push(log.clone());
+                }
+                "discard" => {
+                    output.discard(false)?;
+                    expected.retain(|path| !path.ends_with("-shm"));
+                }
+                _ => {
+                    output.discard(true)?;
+                    expected.push(log.clone());
+                }
+            }
+            expected.sort();
+            assert_eq!(sidecars_beside(&dest_path), expected, "after {step}");
+            assert_eq!(
+                std::fs::read(format!("{dest}-wal")).unwrap(),
+                b"theirs",
+                "after {step}"
+            );
+        }
         Ok(())
     }
 
