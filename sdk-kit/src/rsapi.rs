@@ -159,6 +159,7 @@ pub struct TursoDatabaseConfig {
 
     /// comma-separated list of experimental features to enable
     /// this field is intentionally just a string in order to make enablement of experimental features as flexible as possible
+    /// the non-experimental option "foreign_keys" turns `PRAGMA foreign_keys` on by default for new connections
     pub experimental_features: Option<String>,
 
     /// if true, library methods will return Io status code and delegate Io loop to the caller
@@ -404,6 +405,8 @@ impl TursoDatabaseConfig {
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
+                // not experimental: makes `PRAGMA foreign_keys` default to ON for new connections
+                "foreign_keys" => opts.with_foreign_keys(true),
                 // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
                 _ => opts,
             };
@@ -2275,6 +2278,10 @@ mod tests {
         assert!(opts.enable_attach);
         assert!(opts.enable_multiprocess_wal);
         assert!(opts.enable_without_rowid);
+        assert!(!opts.foreign_keys);
+        assert!(config_with_features(Some("foreign_keys"))
+            .database_opts()
+            .foreign_keys);
 
         // Whitespace is trimmed; `strict`, `generated_columns` and unknown names are ignored.
         let opts = config_with_features(Some(" views , strict , unknown_one ")).database_opts();
