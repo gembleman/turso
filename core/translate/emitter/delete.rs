@@ -350,7 +350,7 @@ fn emit_clear_btree_delete(
     if crate::stats::is_stats_table(&table.name) {
         // No cursor is opened for the clear, so the scan for `OpenWrite` on a
         // stats table in `ProgramBuilder::build` would miss this write.
-        program.note_stats_table_write();
+        program.note_stats_table_write(table_ref.namespace.database_id);
     }
     for index in &plan.indexes {
         program.emit_insn(Insn::ClearBtree {
