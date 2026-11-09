@@ -387,11 +387,18 @@ impl Database {
 /// A prepared statement.
 #[derive(Clone)]
 pub struct Statement {
-    conn: Connection,
+    // Field order matters: fields drop in declaration order, and `inner` (whose
+    // last owner resets/aborts the statement in the engine) must drop before
+    // `conn`. Otherwise `Connection::is_sole_handle` / `is_reusable` could
+    // report true while statement cleanup is still running on another thread.
     inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+    conn: Connection,
 }
 
 struct Execute {
+    // `stmt` is a clone of the caller's `&mut Statement`, which outlives this
+    // future and keeps the connection counted, so the drop order of these two
+    // fields cannot expose a half-cleaned-up connection.
     stmt: Statement,
     _operation_guard: Option<connection::ConnectionOperationGuard>,
 }
