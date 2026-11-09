@@ -3,8 +3,10 @@ use turso_core::schema::Schema;
 use turso_core::security::roles::SessionRole;
 use turso_core::sync::Arc;
 use turso_core::ConnectOpts;
+use turso_core::Connection;
 use turso_core::Database;
 use turso_core::DatabaseOpts;
+use turso_core::MemoryIO;
 use turso_core::OpenFlags;
 use turso_core::PlatformIO;
 use turso_core::IO;
@@ -201,4 +203,164 @@ fn assert_table_t_stats(schema: &Schema) {
     assert_eq!(t_a.total_rows, Some(2));
     let t_b = t.index_stats.get("t_b").expect("index t_b must have stats");
     assert_eq!(t_b.total_rows, Some(2));
+}
+
+fn open_memory_db() -> Arc<Database> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap()
+}
+
+fn connect(db: &Arc<Database>) -> Arc<Connection> {
+    db.connect(ConnectOpts::new(SessionRole::Superuser)).unwrap()
+}
+
+fn scans(db: &Arc<Database>) -> u64 {
+    db.stats_scan_count()
+}
+
+fn t_row_count(conn: &Arc<Connection>) -> Option<u64> {
+    conn.current_schema()
+        .analyze_stats
+        .table_stats(NamespaceId::ROOT, "t")
+        .and_then(|stats| stats.row_count)
+}
+
+/// A database with an analyzed table `t` of three rows, and the connection
+/// that analyzed it.
+fn analyzed_db() -> (Arc<Database>, Arc<Connection>) {
+    let db = open_memory_db();
+    let writer = connect(&db);
+    writer
+        .execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    writer.execute("CREATE INDEX t_b ON t (b)").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)")
+        .unwrap();
+    writer.execute("ANALYZE").unwrap();
+    // The first connection after a stats-changing step may still have to
+    // load; what matters is that the ones after it do not.
+    let warm = connect(&db);
+    assert_eq!(t_row_count(&warm), Some(3));
+    (db, writer)
+}
+
+#[test]
+fn stats_are_loaded_once_across_connections() {
+    let (db, _writer) = analyzed_db();
+    let before = scans(&db);
+    for _ in 0..5 {
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(3));
+    }
+    assert_eq!(scans(&db), before, "unchanged stats must not be rescanned");
+}
+
+#[test]
+fn databases_without_stats_never_scan() {
+    let db = open_memory_db();
+    let conn = connect(&db);
+    conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    for _ in 0..3 {
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), None);
+    }
+    assert_eq!(scans(&db), 0);
+}
+
+#[test]
+fn plain_writes_keep_stats_fresh() {
+    let (db, writer) = analyzed_db();
+    let before = scans(&db);
+    writer
+        .execute("INSERT INTO t VALUES (4, 4), (5, 5)")
+        .unwrap();
+    let conn = connect(&db);
+    // Stats describe the last ANALYZE, not the current rows.
+    assert_eq!(t_row_count(&conn), Some(3));
+    assert_eq!(scans(&db), before);
+}
+
+#[test]
+fn analyze_refreshes_stats_for_new_connections() {
+    let (db, writer) = analyzed_db();
+    writer
+        .execute("INSERT INTO t VALUES (4, 4), (5, 5)")
+        .unwrap();
+    let other = connect(&db);
+    other.execute("ANALYZE").unwrap();
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(5));
+    let before = scans(&db);
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(5));
+    assert_eq!(scans(&db), before);
+}
+
+#[test]
+fn direct_stat1_writes_refresh_stats_for_new_connections() {
+    let (db, writer) = analyzed_db();
+    writer.execute("DELETE FROM sqlite_stat1").unwrap();
+    writer
+        .execute("INSERT INTO sqlite_stat1 VALUES ('t', NULL, '42')")
+        .unwrap();
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(42));
+    let before = scans(&db);
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(42));
+    assert_eq!(scans(&db), before);
+}
+
+#[test]
+fn uncommitted_stat1_writes_are_picked_up_after_commit() {
+    let (db, writer) = analyzed_db();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("DELETE FROM sqlite_stat1").unwrap();
+    writer
+        .execute("INSERT INTO sqlite_stat1 VALUES ('t', NULL, '42')")
+        .unwrap();
+    // Connections made while the writer is open see the committed rows and
+    // must not cache them as fresh.
+    for _ in 0..2 {
+        let conn = connect(&db);
+        assert_eq!(t_row_count(&conn), Some(3));
+    }
+    writer.execute("COMMIT").unwrap();
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(42));
+}
+
+#[test]
+fn rolled_back_stat1_writes_keep_old_stats() {
+    let (db, writer) = analyzed_db();
+    writer.execute("BEGIN").unwrap();
+    writer.execute("DELETE FROM sqlite_stat1").unwrap();
+    writer.execute("ROLLBACK").unwrap();
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(3));
+}
+
+#[test]
+fn schema_changes_reload_stats() {
+    let (db, writer) = analyzed_db();
+    writer.execute("CREATE TABLE u (x)").unwrap();
+    let before = scans(&db);
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(3));
+    assert!(scans(&db) > before, "DDL must invalidate loaded stats");
+    let before = scans(&db);
+    let conn = connect(&db);
+    assert_eq!(t_row_count(&conn), Some(3));
+    assert_eq!(scans(&db), before);
 }
