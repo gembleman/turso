@@ -245,6 +245,7 @@ pub struct HashJoinMetrics {
     pub probe_spill_bytes_written: u64,
     pub probe_spill_chunks: u64,
     pub grace_partitions_processed: u64,
+    pub grace_partitions_split: u64,
     pub grace_probe_rows_streamed: u64,
     pub grace_probe_rows_buffered: u64,
     pub grace_matches: u64,
@@ -273,6 +274,9 @@ impl HashJoinMetrics {
         self.grace_partitions_processed = self
             .grace_partitions_processed
             .wrapping_add(other.grace_partitions_processed);
+        self.grace_partitions_split = self
+            .grace_partitions_split
+            .wrapping_add(other.grace_partitions_split);
         self.grace_probe_rows_streamed = self
             .grace_probe_rows_streamed
             .wrapping_add(other.grace_probe_rows_streamed);
@@ -436,6 +440,11 @@ impl fmt::Display for StatementMetrics {
             f,
             "    Grace partitions:  {}",
             self.hash_join.grace_partitions_processed
+        )?;
+        writeln!(
+            f,
+            "    Grace split:       {}",
+            self.hash_join.grace_partitions_split
         )?;
         writeln!(
             f,
