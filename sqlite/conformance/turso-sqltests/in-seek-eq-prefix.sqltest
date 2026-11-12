@@ -130,8 +130,7 @@ test join-reaches-composite-primary-key-by-its-prefix {
     WHERE p.k = 'k1' AND c.t IN ('u', 'w');
 }
 expect pattern {
-    \d+\|0\|0\|SEARCH p USING INDEX p_k \(k=\?\)
-    \d+\|0\|0\|SEARCH c USING INDEX sqlite_autoindex_c_1 \(id=\?\)
+    \d+\|0\|0\|SEARCH p USING INDEX p_k \(k=\?\)\n\d+\|0\|0\|SEARCH c USING INDEX sqlite_autoindex_c_1 \(id=\?\)
 }
 
 @setup composite_pk_join
