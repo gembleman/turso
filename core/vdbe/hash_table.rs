@@ -4565,7 +4565,8 @@ impl HashTable {
                 }
                 partition.state = PartitionState::Loaded;
                 // `record_partition_resident` is the only place that sets `resident_mem`.
-                let resident_mem = if let Some(distinct_values) = &partition.loaded_distinct_values {
+                let resident_mem = if let Some(distinct_values) = &partition.loaded_distinct_values
+                {
                     distinct_values.memory_bytes()
                 } else {
                     Self::loaded_join_row_mem(&partition.buckets)
