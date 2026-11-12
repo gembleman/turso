@@ -448,6 +448,24 @@ fn estimate_selectivity(
                         }
                     }
                 } else {
+                    // Without stats SQLite assumes 10 rows per key for the first
+                    // column of any index (sqlite3DefaultRowEst). Apply that to a
+                    // composite PRIMARY KEY's autoindex: `sel_eq_indexed` would
+                    // cost one key as 1000 rows and make a scan of the other
+                    // table look cheaper than seeking by the primary key prefix.
+                    let is_pk_prefix = in_composite_pk
+                        && index.unique
+                        && index.columns.len() > 1
+                        && column.is_some_and(|c| {
+                            c.primary_key()
+                                && index.columns.first().is_some_and(|ic| {
+                                    c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&ic.name))
+                                })
+                        });
+                    if is_pk_prefix {
+                        return (params.rows_per_composite_pk_key / params.rows_per_table_fallback)
+                            .min(1.0);
+                    }
                     return params.sel_eq_indexed;
                 }
                 // Fallback: use hardcoded selectivity for non-indexed columns
