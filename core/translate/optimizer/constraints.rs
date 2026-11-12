@@ -459,7 +459,9 @@ fn estimate_selectivity(
                         && column.is_some_and(|c| {
                             c.primary_key()
                                 && index.columns.first().is_some_and(|ic| {
-                                    c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&ic.name))
+                                    c.name
+                                        .as_deref()
+                                        .is_some_and(|n| n.eq_ignore_ascii_case(&ic.name))
                                 })
                         });
                     if is_pk_prefix {
