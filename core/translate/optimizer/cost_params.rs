@@ -20,9 +20,10 @@ pub struct CostModelParams {
     /// Estimated rows per table B-tree page.
     pub rows_per_table_page: f64,
 
-    /// Assumed rows per key for an equality on a column of a composite PRIMARY
-    /// KEY when no ANALYZE stats exist (SQLite's default for an index's first
-    /// column is 10).
+    /// Assumed rows per key for a join probe (the key comes from another
+    /// table) on the first column of a composite PRIMARY KEY when no ANALYZE
+    /// stats exist (SQLite's default for an index's first column is 10).
+    /// Constant and parameter equalities keep `sel_eq_indexed`.
     pub rows_per_composite_pk_key: f64,
 
     // === Selectivity Fallbacks ===
