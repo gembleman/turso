@@ -1934,7 +1934,10 @@ fn subprocess_deferred_txn_with_snapshot_keeps_old_schema() {
     conn.execute("create table t(value integer)").unwrap();
 
     conn.execute("begin deferred").unwrap();
-    assert_eq!(get_rows_without_schema_retry(&conn, "select * from t").len(), 0);
+    assert_eq!(
+        get_rows_without_schema_retry(&conn, "select * from t").len(),
+        0
+    );
 
     run_schema_child(db_path_str);
 
@@ -1942,7 +1945,10 @@ fn subprocess_deferred_txn_with_snapshot_keeps_old_schema() {
         conn.prepare("select value from child_table").is_err(),
         "a transaction holding a snapshot must not see the remote table"
     );
-    assert_eq!(get_rows_without_schema_retry(&conn, "select * from t").len(), 0);
+    assert_eq!(
+        get_rows_without_schema_retry(&conn, "select * from t").len(),
+        0
+    );
     conn.execute("commit").unwrap();
 
     conn.execute("begin deferred").unwrap();
