@@ -856,7 +856,7 @@ mod tests {
     }
 
     fn connect(db: &Arc<Database>) -> Arc<Connection> {
-        db.connect(ConnectOpts::new()).unwrap()
+        db.connect(ConnectOpts::new(crate::security::roles::SessionRole::Superuser)).unwrap()
     }
 
     fn scans(db: &Arc<Database>) -> u64 {
