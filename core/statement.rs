@@ -1014,7 +1014,13 @@ impl Statement {
     fn reprepare(&mut self) -> Result<()> {
         tracing::trace!("repreparing statement");
         let conn = self.program.connection.clone();
-        if conn.get_auto_commit() && !conn.schema_reparse_in_progress() {
+        // An explicit transaction that holds no snapshot yet (BEGIN DEFERRED before its
+        // first read, or a statement that just dropped its fresh snapshot) can reload
+        // the schema from disk like autocommit does.
+        let holds_no_snapshot = conn.get_tx_state() == TransactionState::None
+            && conn.mv_store().is_none()
+            && conn.get_mv_tx().is_none();
+        if (conn.get_auto_commit() || holds_no_snapshot) && !conn.schema_reparse_in_progress() {
             conn.maybe_reparse_schema()?;
         }
 
