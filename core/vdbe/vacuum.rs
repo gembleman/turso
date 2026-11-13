@@ -4022,7 +4022,7 @@ mod tests {
             None,
             Arc::new(EngineDialect),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT NOT NULL, v BLOB NOT NULL)")?;
         conn.execute("CREATE INDEX t_k ON t(k)")?;
         for row in 0..ROWS {
@@ -4421,7 +4421,7 @@ mod tests {
             None,
             Arc::new(EngineDialect),
         )?;
-        let conn = db.connect(ConnectOpts::new())?;
+        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
         Ok((db, conn))
     }
 
@@ -4850,7 +4850,7 @@ mod tests {
         let io: Arc<dyn crate::IO> = Arc::new(DeferredIo::new()?);
         let (db, second_conn) = open_file_db(io.clone(), source_path.to_str().unwrap())?;
         create_atomicity_fixture(&second_conn)?;
-        let first_conn = db.connect(ConnectOpts::new())?;
+        let first_conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
 
         let mut first = first_conn.prepare(format!("VACUUM INTO '{dest}'"))?;
         let mut step_first = || -> Result<bool> {
