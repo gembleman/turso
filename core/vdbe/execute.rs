@@ -4962,6 +4962,10 @@ pub fn op_transaction_inner(
                         // then we shouldn't be setting the auto_txn_cleanup, this will cause errors in case the client explicitly calls commit post a drop of the statement struct
                         if conn.get_auto_commit() {
                             state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                        } else if is_main_db
+                            && matches!(new_transaction_state, TransactionState::Read)
+                        {
+                            state.began_explicit_read_snapshot = true;
                         }
                     }
 
@@ -5073,6 +5077,16 @@ pub fn op_transaction_inner(
                                 header_schema_cookie,
                                 *schema_cookie
                             );
+                            if state.began_explicit_read_snapshot && is_main_db {
+                                // Like SQLite, a deferred transaction takes its snapshot at the
+                                // first read, and this statement has read nothing yet. Drop the
+                                // snapshot so the reprepare can reload the schema from disk and
+                                // retake a fresh one. A snapshot held by an earlier statement
+                                // is never dropped: it keeps reporting SchemaUpdated.
+                                state.began_explicit_read_snapshot = false;
+                                pager.end_read_tx();
+                                program.connection.set_tx_state(TransactionState::None);
+                            }
                             return Err(LimboError::SchemaUpdated.into());
                         }
                     }

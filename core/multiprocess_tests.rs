@@ -1880,6 +1880,77 @@ fn multiprocess_shm_schema_child_process() {
         .unwrap();
 }
 
+fn run_schema_child(db_path: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child schema process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// BEGIN DEFERRED takes no snapshot, so the first read of the transaction must pick up a
+/// schema another process changed in the meantime instead of failing with SchemaUpdated.
+#[test]
+fn subprocess_deferred_txn_first_read_reloads_remote_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("deferred-first-read-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    run_schema_child(db_path_str);
+
+    conn.execute("begin deferred").unwrap();
+    let rows = get_rows_without_schema_retry(&conn, "select value from child_table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "child-schema");
+    conn.execute("commit").unwrap();
+}
+
+/// A transaction that already holds a snapshot keeps its old schema: the remote table stays
+/// invisible until the transaction ends, and is visible to the next transaction.
+#[test]
+fn subprocess_deferred_txn_with_snapshot_keeps_old_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("deferred-snapshot-schema.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    conn.execute("begin deferred").unwrap();
+    assert_eq!(get_rows_without_schema_retry(&conn, "select * from t").len(), 0);
+
+    run_schema_child(db_path_str);
+
+    assert!(
+        conn.prepare("select value from child_table").is_err(),
+        "a transaction holding a snapshot must not see the remote table"
+    );
+    assert_eq!(get_rows_without_schema_retry(&conn, "select * from t").len(), 0);
+    conn.execute("commit").unwrap();
+
+    conn.execute("begin deferred").unwrap();
+    let rows = get_rows_without_schema_retry(&conn, "select value from child_table");
+    assert_eq!(rows.len(), 1);
+    conn.execute("commit").unwrap();
+}
+
 fn attached_count(conn: &Arc<Connection>) -> String {
     get_rows(conn, "select count(*) from owned.test")[0][0].to_string()
 }
