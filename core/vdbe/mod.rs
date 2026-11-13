@@ -1181,6 +1181,11 @@ pub struct ProgramState {
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
+    /// Set when this statement's Transaction opcode took the first read snapshot of an
+    /// explicit transaction on the main database (BEGIN DEFERRED, nothing read yet). Until
+    /// the statement reads a row, that snapshot can be dropped and retaken so a stale
+    /// schema can be reloaded from disk.
+    pub(crate) began_explicit_read_snapshot: bool,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
@@ -1348,6 +1353,7 @@ impl ProgramState {
             view_delta_state: ViewDeltaApplyState::NotStarted,
             populate_matviews_state: None,
             auto_txn_cleanup: TxnCleanup::None,
+            began_explicit_read_snapshot: false,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
@@ -1532,6 +1538,7 @@ impl ProgramState {
         self.view_delta_state = ViewDeltaApplyState::NotStarted;
         self.populate_matviews_state = None;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.began_explicit_read_snapshot = false;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
