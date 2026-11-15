@@ -8520,6 +8520,7 @@ pub mod test {
                 transaction_count: 9,
             },
         );
+        shared.write().metadata.wal_header.lock().page_size = 4096;
         let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
         coordination.cache_frame(7, 1);
         coordination.cache_frame(9, 2);
