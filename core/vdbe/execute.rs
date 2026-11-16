@@ -655,7 +655,10 @@ pub fn op_checkpoint(
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
             pager.clear_checkpoint_state();
             state.explicit_checkpoint_guard = None;
+            // SQLite reports busy as (1, -1, -1); the result row always has 3 integers.
             state.registers[*dest].set_int(1);
+            state.registers[*dest + 1].set_int(-1);
+            state.registers[*dest + 2].set_int(-1);
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
