@@ -14,7 +14,7 @@ on:
 jobs:
   build-native:
     env:
-      FULL: ${{ contains(github.event.head_commit.message, '[full]') || inputs.filter != '' }}
+      FULL: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[full]') }}
     timeout-minutes: 180
     strategy:
       matrix:
@@ -109,8 +109,8 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
           NEXTEST_PROFILE: ci
           SUITE: ${{ matrix.suite }}
-          FILTER: ${{ inputs.filter || (contains(github.event.head_commit.message, '[full]') && 'not binary(fuzz_tests) and not binary(pending_byte_tests)') || 'test(/wal|checkpoint|truncate/)' }}
-          PKGS: ${{ (contains(github.event.head_commit.message, '[full]') || inputs.filter) && '--workspace --exclude memory-benchmark' || '-p core_tester -p turso_core' }}
+          FILTER: ${{ (github.event_name == 'workflow_dispatch' && inputs.filter) || (contains(github.event.head_commit.message, '[full]') && 'not binary(fuzz_tests) and not binary(pending_byte_tests)') || 'test(/wal|checkpoint|truncate/)' }}
+          PKGS: ${{ (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[full]')) && '--workspace --exclude memory-benchmark' || '-p core_tester -p turso_core' }}
         run: |
           # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
           part="${SUITE#nextest}"
