@@ -7199,7 +7199,7 @@ fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> turso_core::Res
 fn vacuum_into_passes_on_yields_of_its_nested_statements() -> turso_core::Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = Database::open_file_with_flags(
-        io,
+        io.clone(),
         "vacuum-yield-source.db",
         OpenFlags::Create,
         DatabaseOpts::new().with_vacuum(true),
@@ -7234,8 +7234,17 @@ fn vacuum_into_passes_on_yields_of_its_nested_statements() -> turso_core::Result
         "the statements nested in VACUUM INTO must yield too"
     );
 
-    let dest_db = TempDatabase::new_with_existent(&dest_path);
-    let dest_conn = dest_db.connect_limbo();
+    // The copy is written through the source database's IO, which is the
+    // MemoryIO here, so it is read back through it.
+    let dest_db = Database::open_file_with_flags(
+        io,
+        dest_path.to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let dest_conn = dest_db.connect(ConnectOpts::new(SessionRole::Superuser))?;
     assert_eq!(scalar_i64(&dest_conn, "SELECT COUNT(*) FROM t"), 8);
     Ok(())
 }
