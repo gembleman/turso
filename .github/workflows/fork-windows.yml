@@ -1,0 +1,160 @@
+# Fork-only: runs the Windows nextest job of rust.yml on a GitHub-hosted
+# runner, because the blacksmith runners exist only in tursodatabase.
+name: Fork Windows nextest
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: nextest filter expression
+        default: "not binary(fuzz_tests) and not binary(pending_byte_tests)"
+jobs:
+  build-native:
+    timeout-minutes: 180
+    strategy:
+      matrix:
+        os: [windows-2025]
+        # The main nextest run and the smaller suites (sync-dir, leak check,
+        # doctests) run on separate machines at the same time instead of one
+        # after another. On pull requests the nextest run is also split in two
+        # with nextest's --partition (every test runs in exactly one part); on
+        # main it stays one job so coverage covers the whole suite.
+        suite: ["nextest"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: "./.github/shared/setup-mold"
+      # Both suites get the same cache key. The nextest suite builds a superset
+      # of what the extra suite needs, so only it saves.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.suite == 'nextest' }}
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install cargo-llvm-cov
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
+        uses: taiki-e/install-action@cargo-llvm-cov
+      # Blacksmith Windows images ship no LLVM; the all-features build pulls in
+      # pg_query, whose bindgen needs libclang.dll and clang's own headers.
+      # Unpack just those from the LLVM installer instead of running it: the
+      # installer writes ~3 GB and took ~42 s. libclang finds the headers in
+      # ../lib/clang next to itself, so the layout is kept.
+      - name: Install LLVM (libclang for bindgen)
+        if: runner.os == 'Windows'
+        run: |
+          $version = "22.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/LLVM-$version-win64.exe"
+          $installer = "$env:RUNNER_TEMP\llvm-installer.exe"
+          $dest = "$env:RUNNER_TEMP\llvm"
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            curl.exe -fsSL -o $installer $url
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 5) { throw "LLVM download failed after $attempt attempts" }
+            Start-Sleep -Seconds (30 * $attempt)
+          }
+          7z x $installer "-o$dest" "bin\libclang.dll" "lib\clang" -y | Out-Null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$dest\bin\libclang.dll")) {
+            throw "Extracting libclang from the LLVM installer failed"
+          }
+          echo "LIBCLANG_PATH=$dest\bin" >> $env:GITHUB_ENV
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install SQLite (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
+      - name: Build
+        run: cargo build --verbose --locked --all-features
+      - name: Test (nextest with coverage)
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
+        env:
+          RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          # Retries failed tests and writes a JUnit report (.config/nextest.toml).
+          NEXTEST_PROFILE: ci
+        # for some reason, test(test_busy_snapshot_immediate) hung with coverage - so let's exclude it from the run for now
+        run: |
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E 'not binary(fuzz_tests) and not binary(pending_byte_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
+          echo "::group::Coverage Summary"
+          cargo llvm-cov report | tee coverage/summary.txt
+          echo "::endgroup::"
+        timeout-minutes: 20
+      - name: Test (nextest)
+        if: (runner.os != 'Linux' || github.event_name == 'pull_request') && startsWith(matrix.suite, 'nextest')
+        shell: bash
+        env:
+          RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          NEXTEST_PROFILE: ci
+          SUITE: ${{ matrix.suite }}
+          FILTER: ${{ inputs.filter }}
+        run: |
+          # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
+          part="${SUITE#nextest}"
+          part="${part# }"
+          partition=()
+          if [ -n "$part" ]; then
+            partition=(--partition "slice:$part")
+          fi
+          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E "$FILTER" "${partition[@]}" --failure-output=final
+        timeout-minutes: 90
+      # On main, report-flaky-tests reads these reports. cargo llvm-cov builds
+      # in its own target directory, hence the glob. job-name.txt lets the
+      # report name and link the job a flaky test ran in.
+      - name: Record job name for the flaky test report
+        if: ${{ !cancelled() && github.event_name == 'push' && matrix.suite == 'nextest' }}
+        shell: bash
+        run: echo "${{ github.job }} (${{ matrix.os }}, ${{ matrix.suite }})" > job-name.txt
+      - name: Upload JUnit report
+        if: ${{ !cancelled() && github.event_name == 'push' && matrix.suite == 'nextest' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ runner.os }}
+          path: |
+            job-name.txt
+            target/**/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      # Same suite against a --sync-dir server, so directory mode's per-database
+      # routing gets the coverage the single-database run above provides.
+      - name: Test sync suite against --sync-dir
+        if: runner.os == 'Linux' && matrix.suite == 'extra'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+          LOCAL_SYNC_SERVER_DIR: "1"
+        run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
+        timeout-minutes: 20
+      - name: Memory leak check (repeated database open/workload/drop)
+        if: matrix.suite == 'extra'
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+        timeout-minutes: 10
+      - name: Test doctests
+        if: matrix.suite == 'extra'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
+      - name: Upload coverage report
+        if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
+
+  # A test that failed and then passed on a retry in a main build is flaky:
+  # file an issue for it, or comment on its open one.
