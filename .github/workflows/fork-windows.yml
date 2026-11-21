@@ -2,6 +2,8 @@
 # runner, because the blacksmith runners exist only in tursodatabase.
 name: Fork Windows nextest
 on:
+  push:
+    branches: ["ci/**"]
   workflow_dispatch:
     inputs:
       filter:
@@ -102,7 +104,7 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
           NEXTEST_PROFILE: ci
           SUITE: ${{ matrix.suite }}
-          FILTER: ${{ inputs.filter }}
+          FILTER: ${{ inputs.filter || 'not binary(fuzz_tests) and not binary(pending_byte_tests)' }}
         run: |
           # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
           part="${SUITE#nextest}"
