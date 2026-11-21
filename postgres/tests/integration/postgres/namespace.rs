@@ -617,8 +617,10 @@ fn vacuum_into_keeps_a_namespace_named_after_a_batch_commit(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE public.big(x INTEGER PRIMARY KEY, y TEXT)")
         .unwrap();
-    conn.execute("INSERT INTO public.big SELECT s, 'row ' || s FROM generate_series(1, 25000) AS s")
-        .unwrap();
+    conn.execute(
+        "INSERT INTO public.big SELECT s, 'row ' || s FROM generate_series(1, 25000) AS s",
+    )
+    .unwrap();
     let shop = conn.create_namespace("shop").unwrap();
     conn.execute("CREATE TABLE shop.t(x INTEGER PRIMARY KEY, y TEXT); INSERT INTO shop.t VALUES (1, 'one'), (2, 'two')")
         .unwrap();
