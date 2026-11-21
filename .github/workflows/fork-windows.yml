@@ -1,5 +1,7 @@
 # Fork-only: runs the Windows nextest job of rust.yml on a GitHub-hosted
 # runner, because the blacksmith runners exist only in tursodatabase.
+# Default: core_tester + turso_core tests matching wal|checkpoint|truncate.
+# Full suite: put [full] in the head commit message.
 name: Fork Windows nextest
 on:
   push:
@@ -11,6 +13,8 @@ on:
         default: "not binary(fuzz_tests) and not binary(pending_byte_tests)"
 jobs:
   build-native:
+    env:
+      FULL: ${{ contains(github.event.head_commit.message, '[full]') || inputs.filter != '' }}
     timeout-minutes: 180
     strategy:
       matrix:
@@ -81,6 +85,7 @@ jobs:
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
       - name: Build
+        if: env.FULL == 'true'
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
         if: runner.os == 'Linux' && github.event_name != 'pull_request' && matrix.suite == 'nextest'
@@ -104,7 +109,8 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
           NEXTEST_PROFILE: ci
           SUITE: ${{ matrix.suite }}
-          FILTER: ${{ inputs.filter || 'not binary(fuzz_tests) and not binary(pending_byte_tests)' }}
+          FILTER: ${{ inputs.filter || (contains(github.event.head_commit.message, '[full]') && 'not binary(fuzz_tests) and not binary(pending_byte_tests)') || 'test(/wal|checkpoint|truncate/)' }}
+          PKGS: ${{ (contains(github.event.head_commit.message, '[full]') || inputs.filter) && '--workspace --exclude memory-benchmark' || '-p core_tester -p turso_core' }}
         run: |
           # "nextest 1/2" runs part 1 of 2; plain "nextest" runs everything.
           part="${SUITE#nextest}"
@@ -113,7 +119,7 @@ jobs:
           if [ -n "$part" ]; then
             partition=(--partition "slice:$part")
           fi
-          cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude memory-benchmark -E "$FILTER" "${partition[@]}" --failure-output=final
+          cargo nextest run $PKGS --all-features --locked --no-fail-fast -E "$FILTER" "${partition[@]}" --failure-output=final
         timeout-minutes: 90
       # On main, report-flaky-tests reads these reports. cargo llvm-cov builds
       # in its own target directory, hence the glob. job-name.txt lets the
