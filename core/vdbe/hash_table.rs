@@ -8643,7 +8643,7 @@ mod hashtests {
             .find_partition(partition_idx)
             .expect("partition");
         partition.buckets.len() * std::mem::size_of::<HashBucket>()
-            + HashTable::partition_bucket_mem(&partition.buckets)
+            + HashTable::loaded_join_row_mem(&partition.buckets)
     }
 
     struct GraceRun {
