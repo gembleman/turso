@@ -3447,6 +3447,9 @@ impl Database {
             buffer_pool,
             self.pager_state.clone(),
         )?;
+        if self.is_readonly() {
+            pager.mark_read_only();
+        }
         if self.initialized() {
             pager.set_page_size(page_size);
         }
