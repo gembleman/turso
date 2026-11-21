@@ -219,7 +219,8 @@ fn open_memory_db() -> Arc<Database> {
 }
 
 fn connect(db: &Arc<Database>) -> Arc<Connection> {
-    db.connect(ConnectOpts::new(SessionRole::Superuser)).unwrap()
+    db.connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap()
 }
 
 fn scans(db: &Arc<Database>) -> u64 {
