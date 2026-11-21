@@ -54,7 +54,7 @@ tracing = { workspace = true }
 turso-dbhash.workspace = true
 
 [dev-dependencies]
-branches = { version = "0.4.3", default-features = false }
+branches = { version = "0.5.1", default-features = false }
 similar-asserts.workspace = true
 asserting.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
