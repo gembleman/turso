@@ -7334,6 +7334,8 @@ impl YieldInjector for YieldOnEveryOtherTransactionStart {
         point == TransactionYieldPoint::BeforeStart.point()
             && self.visits.fetch_add(1, StdOrdering::SeqCst) % 2 == 0
     }
+}
+
 /// `VACUUM INTO` commits the target in batches of rows / bytes and truncates
 /// the target's WAL every few batches, so that a copy of a database of any
 /// size runs in bounded memory. The copy must be the same database for all
