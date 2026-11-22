@@ -163,7 +163,7 @@ pub struct Sorter {
     chunk_heap: BinaryHeap<(Reverse<Box<BoxedSortableRecord>>, usize)>,
     /// The maximum size of the in-memory buffer in bytes before the records are flushed to a chunk file.
     max_buffer_size: usize,
-    /// The current size of the in-memory buffer in bytes.
+    /// The current size of the in-memory buffer in bytes, including per-record overhead.
     current_buffer_size: usize,
     /// The minimum size of a chunk read buffer in bytes. The actual buffer size can be larger if the largest
     /// record in the buffer is larger than this value.
@@ -365,13 +365,24 @@ impl Sorter {
         current
     }
 
+    /// Bytes one record occupies in memory: the payload, the arena struct, the `key_values`
+    /// array and the pointer in `records`. Counting only the payload lets small records use
+    /// many times `max_buffer_size`.
+    fn in_memory_record_size(&self, payload_size: usize) -> usize {
+        payload_size
+            + size_of::<ArenaSortableRecord>()
+            + self.key_len * size_of::<ValueRef<'static>>()
+            + size_of::<NonNull<ArenaSortableRecord>>()
+    }
+
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
         let payload_size = record.get_payload().len();
+        let record_size = self.in_memory_record_size(payload_size);
         loop {
             match self.insert_state {
                 InsertState::Start => {
                     self.insert_state = InsertState::Insert;
-                    if self.current_buffer_size + payload_size > self.max_buffer_size {
+                    if self.current_buffer_size + record_size > self.max_buffer_size {
                         if let Some(c) = self.flush()? {
                             if !c.succeeded() {
                                 io_yield_one!(c);
@@ -399,7 +410,7 @@ impl Sorter {
                     let record_ref = self.arena.try_alloc(sortable_record)?;
                     // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
                     self.records.try_push(NonNull::from(record_ref))?;
-                    self.current_buffer_size += payload_size;
+                    self.current_buffer_size += record_size;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
                     self.insert_state = InsertState::Start;
@@ -1355,6 +1366,39 @@ mod tests {
                 .expect("Failed to get the next record");
         }
         assert!(!sorter.has_more());
+    }
+
+    #[test]
+    fn insert_counts_per_record_overhead_against_buffer_size() {
+        let io = Arc::new(PlatformIO::new().unwrap());
+        let max_buffer_size = 64 * 1024;
+        let mut sorter = Sorter::new(
+            &[SortOrder::Asc],
+            try_vec![CollationSeq::BINARY].unwrap(),
+            try_vec![None].unwrap(),
+            max_buffer_size,
+            4096,
+            io.clone(),
+            crate::TempStore::Default,
+        )
+        .unwrap();
+
+        let mut max_records_in_memory = 0;
+        for i in 0..20_000i64 {
+            let values = try_vec![Value::from_i64(i), Value::from_i64(i)].unwrap();
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            io.block(|| sorter.insert(&record))
+                .expect("Failed to insert the record");
+            max_records_in_memory = max_records_in_memory.max(sorter.records.len());
+        }
+
+        // The arena structs alone must fit the budget. With payload-only accounting the
+        // 64 KiB budget admits thousands of 12 byte payloads, each with ~100 bytes of overhead.
+        assert!(
+            max_records_in_memory * size_of::<ArenaSortableRecord>() <= max_buffer_size,
+            "{max_records_in_memory} records in memory exceed the {max_buffer_size} byte budget"
+        );
+        assert!(!sorter.chunks.is_empty());
     }
 
     #[cfg(all(
