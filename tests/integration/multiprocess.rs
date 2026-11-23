@@ -2287,8 +2287,12 @@ fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec
 /// back next to a WAL that a later TRUNCATE checkpoint emptied. Every open used
 /// to fail with "short read on WAL frame" because the authority was adopted
 /// although the file no longer held its frames.
+///
+/// With every frame backfilled the main DB file has the data, so both opens
+/// rebuild the authority from the empty WAL. With frames that were not
+/// backfilled the data may be lost: both opens fail with a corruption error.
 #[test]
-fn stale_tshm_with_frames_next_to_empty_wal_opens_and_reads() {
+fn stale_tshm_with_frames_next_to_empty_wal() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("stale-tshm.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -2299,7 +2303,7 @@ fn stale_tshm_with_frames_next_to_empty_wal_opens_and_reads() {
         upper_bound_inclusive: None,
     };
 
-    let stale_tshm = {
+    let (tshm_unbackfilled, tshm_backfilled) = {
         let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
@@ -2312,18 +2316,28 @@ fn stale_tshm_with_frames_next_to_empty_wal_opens_and_reads() {
         bulk_inserts(&conn, 3, 20);
         assert!(wal_max_frame(&conn) > 0);
         assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
-        let stale_tshm = std::fs::read(&tshm_path).unwrap();
+        let tshm_unbackfilled = std::fs::read(&tshm_path).unwrap();
+
+        // Passive backfills every frame and keeps the WAL, so nbackfills
+        // equals max_frame.
+        let passive = run_checkpoint(
+            &conn,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+        assert!(passive.everything_backfilled());
+        let tshm_backfilled = std::fs::read(&tshm_path).unwrap();
 
         let checkpoint = run_checkpoint(&conn, truncate());
         assert!(checkpoint.everything_backfilled());
         assert_eq!(count_test_rows(&conn), 120);
-        stale_tshm
+        (tshm_unbackfilled, tshm_backfilled)
     };
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
 
-    for flags in [OpenFlags::ReadOnly, OpenFlags::default()] {
-        std::fs::write(&tshm_path, &stale_tshm).unwrap();
-        let db = Database::open_file_with_flags(
+    let open = |flags: OpenFlags| {
+        Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             flags,
@@ -2331,11 +2345,29 @@ fn stale_tshm_with_frames_next_to_empty_wal_opens_and_reads() {
             None,
             Arc::new(SqliteDialect),
         )
-        .unwrap_or_else(|e| panic!("open with {flags:?} failed: {e}"));
+    };
+    for flags in [OpenFlags::ReadOnly, OpenFlags::default()] {
+        std::fs::write(&tshm_path, &tshm_backfilled).unwrap();
+        let db = open(flags).unwrap_or_else(|e| panic!("open with {flags:?} failed: {e}"));
         let conn = db
             .connect(ConnectOpts::new(SessionRole::Superuser))
             .unwrap();
         assert_eq!(count_test_rows(&conn), 120, "rows with {flags:?}");
+    }
+    for flags in [OpenFlags::ReadOnly, OpenFlags::default()] {
+        std::fs::write(&tshm_path, &tshm_unbackfilled).unwrap();
+        let err = match open(flags) {
+            Err(err) => err,
+            Ok(db) => match db.connect(ConnectOpts::new(SessionRole::Superuser)) {
+                Err(err) => err,
+                Ok(_) => panic!("open with {flags:?} must fail"),
+            },
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("missing from the WAL file") && message.contains("stale-tshm.db-wal"),
+            "{flags:?}: {message}"
+        );
     }
 }
 

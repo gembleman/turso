@@ -3586,7 +3586,13 @@ impl Database {
                 authority,
                 last_checksum_and_max_frame,
                 buffer_pool,
-            )?));
+            )
+            .map_err(|err| match err {
+                LimboError::Corrupt(message) => {
+                    LimboError::Corrupt(format!("{message}; wal={}", self.wal_path))
+                }
+                err => err,
+            })?));
         }
 
         Ok(Arc::new(WalFile::new(
