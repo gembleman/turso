@@ -2283,6 +2283,62 @@ fn get_rows_without_schema_retry(conn: &Arc<Connection>, query: &str) -> Vec<Vec
     rows
 }
 
+/// A tshm captured while the WAL held frames of a restarted generation, put
+/// back next to a WAL that a later TRUNCATE checkpoint emptied. Every open used
+/// to fail with "short read on WAL frame" because the authority was adopted
+/// although the file no longer held its frames.
+#[test]
+fn stale_tshm_with_frames_next_to_empty_wal_opens_and_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("stale-tshm.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let wal_path = dir.path().join("stale-tshm.db-wal");
+    let tshm_path = dir.path().join("stale-tshm.db-tshm");
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let truncate = || CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    };
+
+    let stale_tshm = {
+        let db = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        conn.execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&conn, 3, 20);
+        // The restart bumps checkpoint_seq above zero.
+        run_checkpoint(&conn, truncate());
+        bulk_inserts(&conn, 3, 20);
+        assert!(wal_max_frame(&conn) > 0);
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        let stale_tshm = std::fs::read(&tshm_path).unwrap();
+
+        let checkpoint = run_checkpoint(&conn, truncate());
+        assert!(checkpoint.everything_backfilled());
+        assert_eq!(count_test_rows(&conn), 120);
+        stale_tshm
+    };
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+
+    for flags in [OpenFlags::ReadOnly, OpenFlags::default()] {
+        std::fs::write(&tshm_path, &stale_tshm).unwrap();
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            flags,
+            multiprocess_wal_db_opts(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap_or_else(|e| panic!("open with {flags:?} failed: {e}"));
+        let conn = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert_eq!(count_test_rows(&conn), 120, "rows with {flags:?}");
+    }
+}
+
 fn run_checkpoint(conn: &Arc<Connection>, mode: CheckpointMode) -> CheckpointResult {
     let pager = conn.get_pager();
     pager
