@@ -3580,19 +3580,21 @@ impl Database {
     ) -> Result<Arc<dyn Wal>> {
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
-            return Ok(Arc::new(WalFile::new_with_shared_coordination(
-                self.io.clone(),
-                self.shared_wal.clone(),
-                authority,
-                last_checksum_and_max_frame,
-                buffer_pool,
-            )
-            .map_err(|err| match err {
-                LimboError::Corrupt(message) => {
-                    LimboError::Corrupt(format!("{message}; wal={}", self.wal_path))
-                }
-                err => err,
-            })?));
+            return Ok(Arc::new(
+                WalFile::new_with_shared_coordination(
+                    self.io.clone(),
+                    self.shared_wal.clone(),
+                    authority,
+                    last_checksum_and_max_frame,
+                    buffer_pool,
+                )
+                .map_err(|err| match err {
+                    LimboError::Corrupt(message) => {
+                        LimboError::Corrupt(format!("{message}; wal={}", self.wal_path))
+                    }
+                    err => err,
+                })?,
+            ));
         }
 
         Ok(Arc::new(WalFile::new(
