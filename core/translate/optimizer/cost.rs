@@ -477,7 +477,6 @@ pub(crate) fn estimate_rows_per_in_seek_value(
             nulls_order: ast::NullsOrder::First,
             eq: Some(EqConstraintRef {
                 constraint_pos: in_constraint_pos,
-                is_const: false,
                 null_matching: false,
             }),
             lower_bound: None,
