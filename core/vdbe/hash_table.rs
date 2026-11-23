@@ -1920,14 +1920,14 @@ fn write_entries_chunk(
         entry_sizes.try_push(entry_size)?;
         total_size += varint_len(entry_size as u64) + entry_size;
     }
-    let buffer = Buffer::new_temporary(total_size);
-    let buf = buffer.as_mut_slice();
-    let mut offset = 0;
+    let mut data = Vec::new();
+    data.try_reserve_exact(total_size)?;
     for (entry, &entry_size) in entries.iter().zip(entry_sizes.iter()) {
-        offset += write_varint(&mut buf[offset..], entry_size as u64);
-        offset += entry.serialize_to_slice(&mut buf[offset..]);
+        write_varint_to_vec(entry_size as u64, &mut data);
+        entry.append_to(&mut data);
     }
-    turso_assert!(offset == total_size, "serialized size mismatch");
+    turso_assert!(data.len() == total_size, "serialized size mismatch");
+    let buffer = Buffer::new(data);
 
     io_state.set(SpillIOState::WaitingForWrite);
     let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
