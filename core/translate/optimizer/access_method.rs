@@ -997,7 +997,6 @@ fn find_best_access_method_for_btree<'a>(
                     order_target,
                     0,
                     schema,
-                    EqualityPrefixScope::AnyEquality,
                 )
                 .consumed
                     == order_target.columns.len()
