@@ -1698,6 +1698,24 @@ impl ShmWalCoordination {
             return;
         }
         self.authority.repair_transient_state_for_exclusive_open();
+        // Writers append frames to the file before they publish max_frame, so
+        // a file shorter than the frames the authority references means those
+        // frames are gone (a truncated WAL next to a tshm that survived).
+        // Adopting the authority would read past the end of the file on every
+        // later open; the file is the truth, even when the authority has a
+        // newer checkpoint_seq. The restart case below does not reach this:
+        // a restarted authority has no frames.
+        if authority_snapshot.max_frame > 0
+            && self
+                .wal_file_size_and_size_covering(authority_snapshot)
+                .is_some_and(|(size, covered_size)| size < covered_size)
+        {
+            self.authority
+                .discard_durable_frame_index_for_exclusive_rebuild();
+            self.sync_authority_from_local();
+            self.sync_authority_frames_from_local();
+            return;
+        }
         if authority_snapshot.nbackfills != 0 {
             // A local WAL scan can rebuild the visible WAL tail, but it cannot
             // prove that positive checkpoint progress is durable in the main DB
@@ -1789,6 +1807,16 @@ impl ShmWalCoordination {
         {
             return false;
         }
+        self.wal_file_size_and_size_covering(authority_snapshot)
+            .is_some_and(|(size, covered_size)| size >= covered_size)
+    }
+
+    /// The WAL file's length and the length that holds every frame the
+    /// authority references. `None` when there is no file to measure.
+    fn wal_file_size_and_size_covering(
+        &self,
+        authority_snapshot: SharedWalCoordinationHeader,
+    ) -> Option<(u64, u64)> {
         let wal_size = {
             let shared = self.shared.read();
             shared
@@ -1796,14 +1824,14 @@ impl ShmWalCoordination {
                 .file
                 .as_ref()
                 .and_then(|file| file.size().ok())
-        };
+        }?;
         let frame_size =
             (WAL_FRAME_HEADER_SIZE as u64).saturating_add(authority_snapshot.page_size as u64);
         let covered_size = authority_snapshot
             .max_frame
             .saturating_mul(frame_size)
             .saturating_add(WAL_HEADER_SIZE as u64);
-        wal_size.is_some_and(|size| size >= covered_size)
+        Some((wal_size, covered_size))
     }
 
     fn local_scan_cannot_disprove_zero_frame_authority(
@@ -8778,6 +8806,27 @@ pub mod test {
         assert_eq!(coordination.load_snapshot().max_frame, 2);
         assert_eq!(coordination.wal_header().page_size, 4096);
         assert!(!authority.writer_or_checkpoint_lock_active());
+    }
+
+    /// A newer checkpoint_seq does not make an authority that references
+    /// frames beyond the WAL file trustworthy: after a truncated WAL the
+    /// sole mapper rebuilds it from its scan instead of adopting it.
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn sole_mapper_reseeds_a_newer_generation_authority_beyond_the_wal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let io = shared_wal_test_io();
+        let (stale_shared, shm_path, mut committed) =
+            no_header_scan_view_and_committed_snapshot(&io, dir.path(), false);
+        committed.checkpoint_seq = 3;
+        let authority =
+            Arc::new(MappedSharedWalCoordination::create_or_open(&io, &shm_path, 64).unwrap());
+        authority.install_snapshot(committed);
+        assert!(authority.is_last_process_mapping());
+
+        let coordination = ShmWalCoordination::new(stale_shared, authority.clone()).unwrap();
+        assert_eq!(authority.snapshot().max_frame, 0);
+        assert_eq!(coordination.load_snapshot().max_frame, 0);
     }
 
     /// The only mapper with an authority that references frames the WAL file
