@@ -8821,9 +8821,8 @@ pub mod test {
         assert!(authority.is_last_process_mapping());
         let installed = authority.snapshot();
 
-        let err = ShmWalCoordination::new(stale_shared, authority.clone())
-            .err()
-            .expect("open must fail");
+        let err =
+            ShmWalCoordination::new(stale_shared, authority.clone()).expect_err("open must fail");
         let message = match err {
             LimboError::Corrupt(message) => message,
             other => panic!("expected a corruption error, got {other:?}"),
