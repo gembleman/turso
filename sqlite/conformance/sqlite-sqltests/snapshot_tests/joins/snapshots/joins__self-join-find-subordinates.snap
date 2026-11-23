@@ -24,5 +24,4 @@ info:
 QUERY PLAN
 |--SCAN employees AS m
 |--SEARCH e USING INDEX idx_employees_manager_id (manager_id=?)
-|--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY
