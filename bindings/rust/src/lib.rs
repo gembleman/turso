@@ -175,6 +175,7 @@ pub struct Builder {
     enable_vacuum: bool,
     enable_autovacuum: bool,
     enable_multiprocess_wal: bool,
+    immutable: bool,
     enable_without_rowid: bool,
     enable_mvcc_passive_checkpoint: bool,
     foreign_keys: bool,
@@ -197,6 +198,7 @@ impl Builder {
             enable_vacuum: false,
             enable_autovacuum: false,
             enable_multiprocess_wal: false,
+            immutable: false,
             enable_without_rowid: false,
             enable_mvcc_passive_checkpoint: false,
             foreign_keys: false,
@@ -266,6 +268,14 @@ impl Builder {
         self
     }
 
+    /// Open a writer-less, checkpointed database file (no `-wal` frames, no
+    /// `-tshm`) without any WAL coordination. Requires `read_only(true)`;
+    /// `build` fails otherwise, or when WAL frames or a `-tshm` exist.
+    pub fn immutable(mut self, enabled: bool) -> Self {
+        self.immutable = enabled;
+        self
+    }
+
     pub fn experimental_without_rowid(mut self, enabled: bool) -> Self {
         self.enable_without_rowid = enabled;
         self
@@ -326,6 +336,9 @@ impl Builder {
         }
         if self.enable_multiprocess_wal {
             features.push("multiprocess_wal");
+        }
+        if self.immutable {
+            features.push("immutable");
         }
         if self.enable_without_rowid {
             features.push("without_rowid");

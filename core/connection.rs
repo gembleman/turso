@@ -1602,6 +1602,7 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
+        let db_opts = db_opts.with_immutable(db_opts.immutable || opts.immutable);
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
@@ -1699,6 +1700,11 @@ impl Connection {
             && (is_memory_like(&opts.path) || !io.supports_shared_wal_coordination())
         {
             db_opts = db_opts.with_multiprocess_wal(false);
+        }
+        // An immutable attach has no writer to coordinate with, whatever the
+        // main database does.
+        if opts.immutable {
+            db_opts = db_opts.with_multiprocess_wal(false).with_immutable(true);
         }
         let db = Database::open(
             io.clone(),
