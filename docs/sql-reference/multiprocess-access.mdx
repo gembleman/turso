@@ -123,6 +123,16 @@ Or via DSN:
 db, err := sql.Open("turso", "mydb.db?experimental=multiprocess_wal")
 ```
 
+## Read-Only Opens
+
+A read-only open with `multiprocess_wal` attaches to the shared memory file of a running writer. If `<db>-tshm` does not exist, the open fails with an error instead of reading through a private WAL index, which would go stale once a writer starts.
+
+To read a copy of a database that no writer has open, checkpoint it with `PRAGMA wal_checkpoint(TRUNCATE)`, copy only the main `.db` file, and open it as immutable (`Builder::immutable(true)` together with `read_only(true)` in the Rust SDK, or `file:copy.db?mode=ro&immutable=1` as a URI, which also works for `ATTACH`):
+
+- The open fails unless it is read-only, and fails if `<db>-tshm` exists or `<db>-wal` is not empty.
+- The reader holds a shared lock on the database file, so a writer without `multiprocess_wal` cannot open it. A multiprocess writer that starts after the open is not stopped; do not write to a file that is open as immutable.
+- Immutable cannot be combined with `multiprocess_wal` on the same open; an immutable `ATTACH` ignores the main database's `multiprocess_wal`.
+
 ## Concurrency Model
 
 Multi-process access preserves Turso's WAL concurrency guarantees across processes:
