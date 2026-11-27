@@ -1310,6 +1310,11 @@ fn immutable_refuses_existing_tshm() {
         .unwrap();
     conn.execute("create table test(id integer primary key, value text)")
         .unwrap();
+    // Close the writer: a live one in this process would be returned from the
+    // database registry before the open checks run. The `.tshm` outlives it.
+    drop(conn);
+    drop(writer);
+    assert!(dir.path().join("live.db-tshm").exists());
 
     let err = open_immutable_db(io, db_path_str, OpenFlags::ReadOnly)
         .expect_err("immutable open must refuse a database with a coordination file");
