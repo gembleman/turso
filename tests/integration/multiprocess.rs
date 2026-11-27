@@ -1288,7 +1288,11 @@ fn immutable_refuses_nonempty_wal() {
     let copy_dir = tempfile::tempdir().unwrap();
     let copy_path = copy_dir.path().join("copy.db");
     std::fs::copy(&db_path, &copy_path).unwrap();
-    std::fs::copy(format!("{db_path}-wal"), copy_dir.path().join("copy.db-wal")).unwrap();
+    std::fs::copy(
+        format!("{db_path}-wal"),
+        copy_dir.path().join("copy.db-wal"),
+    )
+    .unwrap();
 
     let err = open_immutable_db(io, copy_path.to_str().unwrap(), OpenFlags::ReadOnly)
         .expect_err("immutable open must refuse a WAL with frames");
