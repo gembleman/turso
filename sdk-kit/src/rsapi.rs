@@ -403,6 +403,7 @@ impl TursoDatabaseConfig {
                 "encryption" | "sync_encryption" => opts.with_encryption(true),
                 "attach" => opts.with_attach(true),
                 "multiprocess_wal" => opts.with_multiprocess_wal(true),
+                "immutable" => opts.with_immutable(true),
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
                 // "strict" and "generated_columns" are always enabled, kept for backwards compatibility
@@ -1028,7 +1029,14 @@ impl TursoDatabase {
                     let db_file = if let Some(db_file) = &self.config.db_file {
                         db_file.clone()
                     } else {
+                        turso_core::Database::check_immutable_open(
+                            &self.config.path,
+                            None,
+                            open_flags,
+                            opts,
+                        )?;
                         let file = io.open_file(&self.config.path, open_flags, true)?;
+                        turso_core::Database::lock_immutable_file(&file, &self.config.path, opts)?;
                         Arc::new(DatabaseFile::new(file))
                     };
 

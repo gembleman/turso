@@ -86,6 +86,10 @@ pub struct DatabaseOpts {
     pub enable_vacuum: bool,
     pub enable_attach: bool,
     pub enable_multiprocess_wal: bool,
+    /// Open a writer-less, checkpointed database file without WAL or `.tshm`
+    /// coordination. Requires a read-only open; see
+    /// [`Database::check_immutable_open`].
+    pub immutable: bool,
     pub enable_without_rowid: bool,
     /// Open the database in MVCC mode. A database that is not in MVCC mode
     /// yet has its journal mode switched during open; read-only opens cannot
@@ -154,6 +158,11 @@ impl DatabaseOpts {
 
     pub fn with_multiprocess_wal(mut self, enable: bool) -> Self {
         self.enable_multiprocess_wal = enable;
+        self
+    }
+
+    pub fn with_immutable(mut self, enable: bool) -> Self {
+        self.immutable = enable;
         self
     }
 
@@ -1208,6 +1217,81 @@ impl Database {
         Ok(())
     }
 
+    /// Validates an `immutable` open (no-op otherwise). Nothing coordinates an
+    /// immutable reader with a writer, so it only accepts a file that has no
+    /// writer state next to it: no `.tshm` and no WAL frames. Copy a database
+    /// after a TRUNCATE checkpoint, main file only.
+    pub fn check_immutable_open(
+        path: &str,
+        wal_path: Option<&str>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if !opts.immutable {
+            return Ok(());
+        }
+        if !flags.contains(OpenFlags::ReadOnly) {
+            return Err(LimboError::InvalidArgument(format!(
+                "immutable open of '{path}' requires a read-only open"
+            )));
+        }
+        if opts.enable_multiprocess_wal {
+            return Err(LimboError::InvalidArgument(format!(
+                "immutable open of '{path}' cannot be combined with experimental multiprocess WAL"
+            )));
+        }
+        if is_memory_like(path) {
+            return Err(LimboError::InvalidArgument(
+                "immutable open is not supported for in-memory databases".to_string(),
+            ));
+        }
+        let wal_path = wal_path
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{path}-wal"));
+        let file_len = |p: &str| match std::fs::metadata(p) {
+            Ok(meta) => Ok(Some(meta.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LimboError::InvalidArgument(format!(
+                "immutable open of '{path}' cannot inspect '{p}': {e}"
+            ))),
+        };
+        #[cfg(host_shared_wal)]
+        {
+            let tshm_path = storage::wal::coordination_path_for_wal_path(&wal_path);
+            if file_len(&tshm_path)?.is_some() {
+                return Err(LimboError::InvalidArgument(format!(
+                    "immutable open of '{path}' refused: coordination file '{tshm_path}' exists, so a writer may be live; copy only the checkpointed main database file"
+                )));
+            }
+        }
+        if file_len(&wal_path)?.is_some_and(|len| len > 0) {
+            return Err(LimboError::InvalidArgument(format!(
+                "immutable open of '{path}' refused: WAL '{wal_path}' is not empty; checkpoint with TRUNCATE before copying the database"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Shared lock on the database file for an immutable reader: a writer
+    /// without multiprocess WAL takes an exclusive lock, which then fails.
+    /// A multiprocess writer takes a shared lock too, so one that starts
+    /// after this open is not stopped; that is the immutable contract.
+    pub fn lock_immutable_file(
+        file: &Arc<dyn crate::io::File>,
+        path: &str,
+        opts: DatabaseOpts,
+    ) -> Result<()> {
+        if !opts.immutable || std::env::var(crate::io::common::ENV_DISABLE_FILE_LOCK).is_ok() {
+            return Ok(());
+        }
+        file.lock_file(false).map_err(|err| match err {
+            LimboError::LockingError(_) => LimboError::LockingError(format!(
+                "Failed opening database '{path}' immutable. Database is open for writing in another process"
+            )),
+            err => err,
+        })
+    }
+
     #[cfg(feature = "fs")]
     #[cfg(host_shared_wal)]
     fn lock_database_file_for_multiprocess_open(
@@ -1426,10 +1510,25 @@ impl Database {
             options.wal_path.as_deref(),
             options.db_opts,
         )?;
+        Self::check_immutable_open(
+            path,
+            options.wal_path.as_deref(),
+            options.flags,
+            options.db_opts,
+        )?;
         let effective_flags =
             Self::effective_open_flags_for_path(io, path, options.flags, options.db_opts)?;
 
         let file = io.open_file(path, effective_flags, true)?;
+        Self::lock_immutable_file(&file, path, options.db_opts)?;
+        // Re-check under the lock: a writer that started in between is either
+        // visible now or blocked by the lock.
+        Self::check_immutable_open(
+            path,
+            options.wal_path.as_deref(),
+            options.flags,
+            options.db_opts,
+        )?;
         // 2. multiprocess open takes a shared lock on the database file and
         //    keeps it for the life of the file, so it fails while a legacy
         //    process holds its exclusive lock, and a legacy open fails while

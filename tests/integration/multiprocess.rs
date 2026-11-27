@@ -1224,6 +1224,152 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
     assert!(coordination_open_mode(&readonly).is_none());
 }
 
+fn open_immutable_db(io: Arc<dyn IO>, path: &str, flags: OpenFlags) -> Result<Arc<Database>> {
+    Database::open_file_with_flags(
+        io,
+        path,
+        flags,
+        DatabaseOpts::new().with_immutable(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+}
+
+/// Creates `test` with `rows` rows through a default (non-multiprocess) writer
+/// that stays open, and returns the writer plus its directory.
+fn open_writer_with_rows(
+    io: &Arc<dyn IO>,
+    rows: usize,
+) -> (tempfile::TempDir, String, Arc<Database>, Arc<Connection>) {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("writer.db").to_str().unwrap().to_string();
+    let db = Database::open_file(io.clone(), &db_path, Arc::new(SqliteDialect)).unwrap();
+    let conn = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+    for i in 0..rows {
+        conn.execute(format!("insert into test(value) values ('row{i}')"))
+            .unwrap();
+    }
+    (dir, db_path, db, conn)
+}
+
+#[test]
+fn immutable_reads_checkpointed_db_without_wal() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 3);
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_path = copy_dir.path().join("copy.db");
+    std::fs::copy(&db_path, &copy_path).unwrap();
+
+    let db = open_immutable_db(io, copy_path.to_str().unwrap(), OpenFlags::ReadOnly)
+        .expect("immutable open of a checkpointed copy should succeed");
+    let reader = db
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    assert_eq!(count_test_rows(&reader), 3);
+}
+
+#[test]
+fn immutable_refuses_nonempty_wal() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, _conn) = open_writer_with_rows(&io, 3);
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_path = copy_dir.path().join("copy.db");
+    std::fs::copy(&db_path, &copy_path).unwrap();
+    std::fs::copy(format!("{db_path}-wal"), copy_dir.path().join("copy.db-wal")).unwrap();
+
+    let err = open_immutable_db(io, copy_path.to_str().unwrap(), OpenFlags::ReadOnly)
+        .expect_err("immutable open must refuse a WAL with frames");
+    assert!(
+        matches!(&err, LimboError::InvalidArgument(msg) if msg.contains("copy.db-wal")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn immutable_refuses_existing_tshm() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("live.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let writer = open_multiprocess_db(io.clone(), db_path_str).unwrap();
+    let conn = writer
+        .connect(ConnectOpts::new(SessionRole::Superuser))
+        .unwrap();
+    conn.execute("create table test(id integer primary key, value text)")
+        .unwrap();
+
+    let err = open_immutable_db(io, db_path_str, OpenFlags::ReadOnly)
+        .expect_err("immutable open must refuse a database with a coordination file");
+    assert!(
+        matches!(&err, LimboError::InvalidArgument(msg) if msg.contains("live.db-tshm")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn immutable_requires_readonly() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 1);
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_path = copy_dir.path().join("copy.db");
+    std::fs::copy(&db_path, &copy_path).unwrap();
+
+    let err = open_immutable_db(io, copy_path.to_str().unwrap(), OpenFlags::default())
+        .expect_err("immutable open must require read-only");
+    assert!(
+        matches!(&err, LimboError::InvalidArgument(msg) if msg.contains("read-only")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn immutable_reader_blocks_non_multiprocess_writer() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 1);
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_path = copy_dir.path().join("copy.db");
+    std::fs::copy(&db_path, &copy_path).unwrap();
+    let copy_path_str = copy_path.to_str().unwrap();
+
+    let _reader = open_immutable_db(io, copy_path_str, OpenFlags::ReadOnly).unwrap();
+    // The child expects LockingError from a default open of the same file.
+    let child_output = Command::new(std::env::current_exe().unwrap())
+        .arg(DEFAULT_LOCKED_DB_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", copy_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        child_output.status.success(),
+        "default writer opened a file held by an immutable reader: stdout={}; stderr={}",
+        String::from_utf8_lossy(&child_output.stdout),
+        String::from_utf8_lossy(&child_output.stderr)
+    );
+}
+
 #[test]
 fn subprocess_database_open_selects_multiprocess_shm_backend() {
     let dir = tempfile::tempdir().unwrap();
