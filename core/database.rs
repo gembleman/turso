@@ -3599,12 +3599,13 @@ impl Database {
                 64,
             )?
             else {
-                // Read-only opens cannot create `.tshm`. If no shared
-                // coordination file exists, degrade to the legacy read-only WAL
-                // path rather than failing the open. This keeps binding-level
-                // option plumbing advisory for readers while writable opens
-                // still enforce the stricter multiprocess contract.
-                return Ok(None);
+                // Read-only opens cannot create `.tshm`, and a private WAL index
+                // goes stale as soon as a writer starts (torn pages or silently
+                // wrong rows), so a missing file is an error, not a fallback.
+                return Err(LimboError::InvalidArgument(format!(
+                    "read-only multiprocess open of '{}' requires the coordination file '{path}': the writer must be running, or open a writer-less checkpointed copy with immutable",
+                    self.path
+                )));
             };
             Arc::new(authority)
         } else {

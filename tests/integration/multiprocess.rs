@@ -1197,7 +1197,7 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
 }
 
 #[test]
-fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_file() {
+fn readonly_multiprocess_open_without_coordination_file_errors() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("readonly-multiprocess-no-tshm.db");
     let db_path_str = db_path.to_str().unwrap();
@@ -1212,7 +1212,7 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
             .unwrap();
     }
 
-    let readonly = Database::open_file_with_flags(
+    let err = Database::open_file_with_flags(
         io,
         db_path_str,
         OpenFlags::ReadOnly,
@@ -1220,8 +1220,11 @@ fn readonly_open_with_experimental_multiprocess_wal_allows_missing_coordination_
         None,
         Arc::new(SqliteDialect),
     )
-    .expect("read-only open should degrade gracefully when no .tshm exists");
-    assert!(coordination_open_mode(&readonly).is_none());
+    .expect_err("read-only multiprocess open must not fall back to a private WAL index");
+    assert!(
+        matches!(&err, LimboError::InvalidArgument(msg) if msg.contains("-tshm") && msg.contains("immutable")),
+        "unexpected error: {err:?}"
+    );
 }
 
 fn open_immutable_db(io: Arc<dyn IO>, path: &str, flags: OpenFlags) -> Result<Arc<Database>> {
