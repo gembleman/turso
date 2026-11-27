@@ -1273,9 +1273,14 @@ impl Database {
     }
 
     /// An immutable open asserts that no writer exists, so it must not be
-    /// served by a database this process already has open.
-    fn reject_immutable_registry_hit(path: &str, opts: DatabaseOpts) -> Result<()> {
-        if opts.immutable {
+    /// served by a database this process opened without `immutable`. A cached
+    /// database that is itself immutable has no writer either, so it is shared.
+    fn reject_immutable_registry_hit(
+        path: &str,
+        opts: DatabaseOpts,
+        cached: &Database,
+    ) -> Result<()> {
+        if opts.immutable && !cached.opts.immutable {
             return Err(LimboError::InvalidArgument(format!(
                 "immutable open of '{path}' refused: this process already has the database open; immutable requires no writer"
             )));
@@ -1499,7 +1504,7 @@ impl Database {
                 options.page_codec.as_deref(),
                 options.page_size,
             )? {
-                Self::reject_immutable_registry_hit(path, options.db_opts)?;
+                Self::reject_immutable_registry_hit(path, options.db_opts, &db)?;
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
@@ -1673,7 +1678,7 @@ impl Database {
                     Some(RegistryEntry::Ready(weak)) => {
                         if let Some(db) = weak.upgrade() {
                             drop(registry);
-                            Self::reject_immutable_registry_hit(path, options.db_opts)?;
+                            Self::reject_immutable_registry_hit(path, options.db_opts, &db)?;
                             tracing::debug!("took database {path:?} from the registry");
 
                             db.validate_encryption_options(options.encryption.as_ref())?;

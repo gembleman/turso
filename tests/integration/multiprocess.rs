@@ -1342,6 +1342,34 @@ fn immutable_refuses_database_open_in_this_process() {
 }
 
 #[test]
+fn immutable_reopen_shares_immutable_database() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 3);
+    run_checkpoint(
+        &conn,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+    let copy_dir = tempfile::tempdir().unwrap();
+    let copy_path = copy_dir.path().join("copy.db");
+    std::fs::copy(&db_path, &copy_path).unwrap();
+    let copy_path = copy_path.to_str().unwrap();
+
+    let first = open_immutable_db(io.clone(), copy_path, OpenFlags::ReadOnly)
+        .expect("first immutable open should succeed");
+    let second = open_immutable_db(io, copy_path, OpenFlags::ReadOnly)
+        .expect("second immutable open of the same file should share the first");
+    assert!(Arc::ptr_eq(&first, &second));
+    for db in [&first, &second] {
+        let reader = db
+            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .unwrap();
+        assert_eq!(count_test_rows(&reader), 3);
+    }
+}
+
+#[test]
 fn immutable_requires_readonly() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 1);
