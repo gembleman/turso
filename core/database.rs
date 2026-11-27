@@ -1272,6 +1272,17 @@ impl Database {
         Ok(())
     }
 
+    /// An immutable open asserts that no writer exists, so it must not be
+    /// served by a database this process already has open.
+    fn reject_immutable_registry_hit(path: &str, opts: DatabaseOpts) -> Result<()> {
+        if opts.immutable {
+            return Err(LimboError::InvalidArgument(format!(
+                "immutable open of '{path}' refused: this process already has the database open; immutable requires no writer"
+            )));
+        }
+        Ok(())
+    }
+
     /// Shared lock on the database file for an immutable reader: a writer
     /// without multiprocess WAL takes an exclusive lock, which then fails.
     /// A multiprocess writer takes a shared lock too, so one that starts
@@ -1488,6 +1499,7 @@ impl Database {
                 options.page_codec.as_deref(),
                 options.page_size,
             )? {
+                Self::reject_immutable_registry_hit(path, options.db_opts)?;
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
@@ -1661,6 +1673,7 @@ impl Database {
                     Some(RegistryEntry::Ready(weak)) => {
                         if let Some(db) = weak.upgrade() {
                             drop(registry);
+                            Self::reject_immutable_registry_hit(path, options.db_opts)?;
                             tracing::debug!("took database {path:?} from the registry");
 
                             db.validate_encryption_options(options.encryption.as_ref())?;
