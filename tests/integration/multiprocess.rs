@@ -1329,6 +1329,19 @@ fn immutable_refuses_existing_tshm() {
 }
 
 #[test]
+fn immutable_refuses_database_open_in_this_process() {
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let (_dir, db_path, _db, _conn) = open_writer_with_rows(&io, 1);
+
+    let err = open_immutable_db(io, &db_path, OpenFlags::ReadOnly)
+        .expect_err("immutable open must not reuse a database this process has open");
+    assert!(
+        matches!(&err, LimboError::InvalidArgument(msg) if msg.contains("already has the database open")),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
 fn immutable_requires_readonly() {
     let io: Arc<dyn IO> = multiprocess_test_io();
     let (_dir, db_path, _db, conn) = open_writer_with_rows(&io, 1);
