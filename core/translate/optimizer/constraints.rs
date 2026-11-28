@@ -72,6 +72,10 @@ pub struct Constraint {
     /// the lhs_mask contains t2 and t3. Thus, this constraint can only be used if t2 and t3
     /// have already been joined (i.e. are on the left side of the join order relative to t1).
     pub lhs_mask: TableMask,
+    /// Whether the constraining side refers to another table or to an outer query,
+    /// so the seek runs once per row of that table. Without stats the row estimate
+    /// of such a seek is not the one of a constant lookup.
+    pub is_join_probe: bool,
     /// An estimated selectivity factor (0.0 to 1.0) indicating the fraction of rows
     /// expected to satisfy this constraint. Used for cost and cardinality estimation.
     pub selectivity: f64,
@@ -936,6 +940,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask,
+                            is_join_probe,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -973,6 +978,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask,
+                            is_join_probe,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -1029,6 +1035,7 @@ pub fn table_constraints_from_where_clause(
                         expr: Some(lhs.clone()),
                         constraining_expr: None,
                         lhs_mask,
+                        is_join_probe,
                         selectivity,
                         usable: true,
                         outer_join_compatible,
@@ -1054,6 +1061,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask,
+                            is_join_probe,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -1091,6 +1099,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask,
+                            is_join_probe,
                             selectivity: estimate_constraint_selectivity(
                                 schema,
                                 table_reference,
@@ -1147,6 +1156,7 @@ pub fn table_constraints_from_where_clause(
                         expr: Some(rhs.clone()),
                         constraining_expr: None,
                         lhs_mask,
+                        is_join_probe,
                         selectivity,
                         usable: true,
                         outer_join_compatible,
@@ -1214,6 +1224,7 @@ pub fn table_constraints_from_where_clause(
                         expr: None,
                         constraining_expr: None,
                         lhs_mask: rhs_mask,
+                        is_join_probe: false,
                         selectivity,
                         usable: false, // IN uses a separate seek path, not the range-seek model
                         outer_join_compatible: can_use_before_null_extension(false),
@@ -1234,6 +1245,7 @@ pub fn table_constraints_from_where_clause(
                         expr: None,
                         constraining_expr: None,
                         lhs_mask: rhs_mask,
+                        is_join_probe: false,
                         selectivity,
                         usable: false,
                         outer_join_compatible: can_use_before_null_extension(false),
@@ -1317,6 +1329,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask: TableMask::default(), // non-correlated = no dependencies
+                            is_join_probe: false,
                             selectivity,
                             usable: false, // IN uses a separate seek path (consider_in_list_seek)
                             outer_join_compatible: can_use_before_null_extension(false),
@@ -1337,6 +1350,7 @@ pub fn table_constraints_from_where_clause(
                             expr: None,
                             constraining_expr: None,
                             lhs_mask: TableMask::default(),
+                            is_join_probe: false,
                             selectivity,
                             usable: false,
                             outer_join_compatible: can_use_before_null_extension(false),
@@ -2424,6 +2438,7 @@ pub(crate) fn analyze_binary_term_for_index(
         && !is_non_null_literal(constraining_expr);
     let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
         .unwrap_or_else(|_| TableMask::default());
+    let is_join_probe = !lhs_mask.is_empty();
     let selectivity = estimate_constraint_selectivity(
         schema,
         table_reference,
@@ -2433,7 +2448,7 @@ pub(crate) fn analyze_binary_term_for_index(
         best_index.as_deref(),
         params,
         is_rowid,
-        !lhs_mask.is_empty(),
+        is_join_probe,
     );
 
     // Cannot use index seek if the constraining expression references the same table
@@ -2462,6 +2477,7 @@ pub(crate) fn analyze_binary_term_for_index(
         expr: None,
         constraining_expr: stored_constraining_expr,
         lhs_mask,
+        is_join_probe,
         selectivity,
         usable: true,
         outer_join_compatible: true,

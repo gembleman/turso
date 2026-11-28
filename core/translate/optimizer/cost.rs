@@ -366,6 +366,10 @@ pub(crate) fn estimate_rows_per_seek(
         }
     }
 
+    if let Some(rows) = default_rows_for_join_probe_prefix(constraints, usable_constraint_refs) {
+        return rows;
+    }
+
     if let Some(rows) = default_rows_for_first_column_of_unique_key(
         index_info,
         constraints,
@@ -399,6 +403,58 @@ pub(crate) fn estimate_rows_per_seek(
 /// without ANALYZE stats. This is the value SQLite's sqlite3DefaultRowEst()
 /// uses for a one-column prefix.
 const DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX: f64 = 10.0;
+
+/// Default rows that match `=` on the first k columns of an index without
+/// ANALYZE stats, for k = 1..6. Longer prefixes use the last entry (5). These are
+/// the values of SQLite's sqlite3DefaultRowEst(), without its 1 row for a
+/// prefix that covers a whole UNIQUE key (`is_unique_point_lookup` does that).
+const DEFAULT_ROWS_PER_INDEX_PREFIX: [f64; 6] = [
+    DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX,
+    9.0,
+    8.0,
+    7.0,
+    6.0,
+    5.0,
+];
+
+/// Rows per seek when the first equality is a join probe and ANALYZE has no
+/// stats. Returns `None` for any other seek.
+///
+/// The per-column estimates multiply, so a constant column after the probe
+/// column cut the estimate by a tenth. A 2-column prefix of a non-unique index
+/// then looked as selective as a full unique key and won against it. SQLite
+/// does not multiply: each extra equality column removes only one row from the
+/// default, and only a full unique key gives 1 row. The estimate is that
+/// default times the selectivity of any range constraint on the next column.
+fn default_rows_for_join_probe_prefix(
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> Option<f64> {
+    let first_eq = usable_constraint_refs.first()?.eq.as_ref()?;
+    if !constraints[first_eq.constraint_pos].is_join_probe {
+        return None;
+    }
+    let eq_prefix_len = usable_constraint_refs
+        .iter()
+        .take_while(|cref| cref.eq.is_some())
+        .count();
+    let default_rows = DEFAULT_ROWS_PER_INDEX_PREFIX
+        [(eq_prefix_len - 1).min(DEFAULT_ROWS_PER_INDEX_PREFIX.len() - 1)];
+    let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
+        .iter()
+        .map(|cref| {
+            let mut selectivity = 1.0;
+            if let Some(lower_bound) = cref.lower_bound {
+                selectivity *= constraints[lower_bound].selectivity;
+            }
+            if let Some(upper_bound) = cref.upper_bound {
+                selectivity *= constraints[upper_bound].selectivity;
+            }
+            selectivity
+        })
+        .product();
+    Some((default_rows * range_selectivity).max(1.0))
+}
 
 /// Rows per seek with `=` on only the first column of a unique index with
 /// several columns, such as a composite primary key, when ANALYZE has no
