@@ -2,7 +2,7 @@ use crate::ast;
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::{WalkControl, walk_expr};
 use crate::translate::optimizer::constraints::{EqConstraintRef, RangeConstraintRef};
 use crate::translate::plan::JoinedTable;
 
@@ -347,26 +347,17 @@ pub(crate) fn estimate_rows_per_seek(
                     .iter()
                     .take_while(|cref| cref.eq.is_some())
                     .count();
-                let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
-                    .iter()
-                    .map(|cref| {
-                        let mut sel = 1.0;
-                        if let Some(lb) = cref.lower_bound {
-                            sel *= constraints[lb].selectivity;
-                        }
-                        if let Some(ub) = cref.upper_bound {
-                            sel *= constraints[ub].selectivity;
-                        }
-                        sel
-                    })
-                    .product();
+                let range_selectivity: f64 =
+                    range_selectivity(constraints, &usable_constraint_refs[eq_prefix_len..]);
                 return (eq_prefix_rows * range_selectivity * join_probe_constant_selectivity)
                     .max(1.0);
             }
         }
     }
 
-    if let Some(rows) = default_rows_for_join_probe_prefix(constraints, usable_constraint_refs) {
+    if let Some(rows) =
+        default_rows_for_join_probe_prefix(constraints, usable_constraint_refs, base_row_count)
+    {
         return rows;
     }
 
@@ -429,6 +420,7 @@ const DEFAULT_ROWS_PER_INDEX_PREFIX: [f64; 6] = [
 fn default_rows_for_join_probe_prefix(
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
+    base_row_count: RowCountEstimate,
 ) -> Option<f64> {
     let first_eq = usable_constraint_refs.first()?.eq.as_ref()?;
     if !constraints[first_eq.constraint_pos].is_join_probe {
@@ -440,20 +432,13 @@ fn default_rows_for_join_probe_prefix(
         .count();
     let default_rows = DEFAULT_ROWS_PER_INDEX_PREFIX
         [(eq_prefix_len - 1).min(DEFAULT_ROWS_PER_INDEX_PREFIX.len() - 1)];
-    let range_selectivity: f64 = usable_constraint_refs[eq_prefix_len..]
-        .iter()
-        .map(|cref| {
-            let mut selectivity = 1.0;
-            if let Some(lower_bound) = cref.lower_bound {
-                selectivity *= constraints[lower_bound].selectivity;
-            }
-            if let Some(upper_bound) = cref.upper_bound {
-                selectivity *= constraints[upper_bound].selectivity;
-            }
-            selectivity
-        })
-        .product();
-    Some((default_rows * range_selectivity).max(1.0))
+    let range_selectivity: f64 =
+        range_selectivity(constraints, &usable_constraint_refs[eq_prefix_len..]);
+    Some(
+        (default_rows * range_selectivity)
+            .min(*base_row_count)
+            .max(1.0),
+    )
 }
 
 /// Rows per seek with `=` on only the first column of a unique index with
@@ -483,8 +468,18 @@ fn default_rows_for_first_column_of_unique_key(
     if eq_prefix_len != 1 {
         return None;
     }
-    let range_selectivity: f64 = usable_constraint_refs[1..]
-        .iter()
+    let range_selectivity: f64 = range_selectivity(constraints, &usable_constraint_refs[1..]);
+    Some(
+        (DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX * range_selectivity)
+            .min(*base_row_count)
+            .max(1.0),
+    )
+}
+
+/// Product of the range bound selectivities of `refs`, the index columns after
+/// the equality prefix of a seek.
+fn range_selectivity(constraints: &[Constraint], refs: &[RangeConstraintRef]) -> f64 {
+    refs.iter()
         .map(|cref| {
             let mut selectivity = 1.0;
             if let Some(lower_bound) = cref.lower_bound {
@@ -495,12 +490,7 @@ fn default_rows_for_first_column_of_unique_key(
             }
             selectivity
         })
-        .product();
-    Some(
-        (DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX * range_selectivity)
-            .min(*base_row_count)
-            .max(1.0),
-    )
+        .product()
 }
 
 /// Estimate how many rows one value of an IN seek matches.
