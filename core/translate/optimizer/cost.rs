@@ -332,7 +332,7 @@ pub(crate) fn estimate_rows_per_seek(
     let join_probe_constant_selectivity =
         join_probe_constant_selectivity(constraints, usable_constraint_refs);
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
-        return join_probe_constant_selectivity;
+        return join_probe_constant_selectivity.max(1.0);
     }
 
     if let Some(ctx) = analyze_ctx {
@@ -360,8 +360,8 @@ pub(crate) fn estimate_rows_per_seek(
                         sel
                     })
                     .product();
-                return (eq_prefix_rows * range_selectivity).max(1.0)
-                    * join_probe_constant_selectivity;
+                return (eq_prefix_rows * range_selectivity * join_probe_constant_selectivity)
+                    .max(1.0);
             }
         }
     }
@@ -372,7 +372,7 @@ pub(crate) fn estimate_rows_per_seek(
         usable_constraint_refs,
         base_row_count,
     ) {
-        return rows * join_probe_constant_selectivity;
+        return (rows * join_probe_constant_selectivity).max(1.0);
     }
 
     let selectivity_multiplier: f64 = usable_constraint_refs
@@ -392,7 +392,7 @@ pub(crate) fn estimate_rows_per_seek(
         })
         .product();
 
-    (selectivity_multiplier * *base_row_count).max(1.0) * join_probe_constant_selectivity
+    (selectivity_multiplier * *base_row_count * join_probe_constant_selectivity).max(1.0)
 }
 
 /// Default number of rows that match `=` on the first column of an index
