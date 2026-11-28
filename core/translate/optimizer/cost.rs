@@ -1,6 +1,7 @@
 use crate::ast;
+use crate::namespace::NamespaceId;
 use crate::schema::Index;
-use crate::stats::AnalyzeStats;
+use crate::stats::{AnalyzeStats, IndexStat};
 use crate::sync::Arc;
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{EqConstraintRef, RangeConstraintRef};
@@ -361,7 +362,20 @@ pub(crate) fn estimate_rows_per_seek(
         }
     }
 
-    if !index_info.ephemeral {
+    // With stats that are too short for the prefix, the index still has real
+    // numbers, so the defaults would contradict them.
+    let index_has_stats = analyze_ctx.is_some_and(|ctx| {
+        ctx.index.is_some_and(|index| {
+            index_stat(
+                ctx.stats,
+                ctx.rhs_table.namespace.id,
+                ctx.rhs_table.table.get_name(),
+                &index.name,
+            )
+            .is_some()
+        })
+    });
+    if !index_info.ephemeral && !index_has_stats {
         if let Some(rows) =
             default_rows_for_join_probe_prefix(constraints, usable_constraint_refs, base_row_count)
         {
@@ -425,7 +439,8 @@ const DEFAULT_ROWS_PER_INDEX_PREFIX: [f64; 6] = [
 /// does not multiply: each extra equality column removes only one row from the
 /// default, and only a full unique key gives 1 row. The estimate is that
 /// default times the selectivity of any range constraint on the next column.
-/// It applies to real indexes only; an ephemeral index has no SQLite default to match.
+/// It applies to real indexes without any stats only; an ephemeral index has no
+/// SQLite default to match.
 /// It does not apply to a null-matching (`IS`) equality, which can match many NULL keys.
 fn default_rows_for_join_probe_prefix(
     constraints: &[Constraint],
@@ -582,6 +597,19 @@ fn join_probe_constant_selectivity(
         .product()
 }
 
+/// The ANALYZE stats of an index, if sqlite_stat1 has an entry for it.
+pub(crate) fn index_stat<'a>(
+    stats: &'a AnalyzeStats,
+    namespace: NamespaceId,
+    table_name: &str,
+    index_name: &str,
+) -> Option<&'a IndexStat> {
+    stats
+        .table_stats(namespace, table_name)?
+        .index_stats
+        .get(index_name)
+}
+
 /// Whether an equality in the leading equality prefix is null-matching (`IS`).
 fn eq_prefix_has_null_matching(constraint_refs: &[RangeConstraintRef]) -> bool {
     constraint_refs
@@ -623,12 +651,12 @@ fn estimate_rows_from_analyze_stats(
         return None;
     }
 
-    let table_name = ctx.rhs_table.table.get_name();
-
-    let table_stats = ctx
-        .stats
-        .table_stats(ctx.rhs_table.namespace.id, table_name)?;
-    let idx_stats = table_stats.index_stats.get(&index.name)?;
+    let idx_stats = index_stat(
+        ctx.stats,
+        ctx.rhs_table.namespace.id,
+        ctx.rhs_table.table.get_name(),
+        &index.name,
+    )?;
 
     if eq_prefix_len <= idx_stats.avg_rows_per_distinct_prefix.len() {
         Some(idx_stats.avg_rows_per_distinct_prefix[eq_prefix_len - 1] as f64)
@@ -838,5 +866,22 @@ mod tests {
             RowCountEstimate::HardcodedFallback(1_000_000.0),
         );
         assert_eq!(rows, None);
+    }
+
+    #[test]
+    fn index_stat_needs_an_entry_for_the_index() {
+        let mut stats = AnalyzeStats::default();
+        assert!(index_stat(&stats, NamespaceId::ROOT, "t", "t_ab").is_none());
+
+        let table_stat = stats.table_stats_mut(NamespaceId::ROOT, "t");
+        table_stat.row_count = Some(1_000_000);
+        assert!(index_stat(&stats, NamespaceId::ROOT, "t", "t_ab").is_none());
+
+        stats
+            .table_stats_mut(NamespaceId::ROOT, "t")
+            .index_stats_mut("t_ab")
+            .avg_rows_per_distinct_prefix = vec![2];
+        assert!(index_stat(&stats, NamespaceId::ROOT, "t", "t_ab").is_some());
+        assert!(index_stat(&stats, NamespaceId::ROOT, "t", "t_other").is_none());
     }
 }

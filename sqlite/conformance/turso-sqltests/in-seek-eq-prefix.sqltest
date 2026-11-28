@@ -199,3 +199,28 @@ test in-400-after-eq-prefix-on-composite-unique {
 expect pattern {
     \d+\|0\|0\|SEARCH e_uniq USING INDEX sqlite_autoindex_e_uniq_1 \(platform_id=\? AND product_id=\?\)
 }
+
+# The default rows for a join probe apply only to an index without stats. Here
+# sqlite_stat1 covers one column of the two-column prefix (2 rows per `a`), so
+# the estimate comes from the stats and not from the default of 9 rows.
+setup short_stat1_join {
+    CREATE TABLE sp (a INTEGER, b INTEGER, v INTEGER);
+    CREATE INDEX sp_ab ON sp(a, b);
+    CREATE TABLE so (a INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('sp', NULL, '1000000'),
+        ('sp', 'sp_ab', '1000000 2'),
+        ('so', NULL, '10');
+    ANALYZE sqlite_schema;
+}
+
+@setup short_stat1_join
+test join-probe-with-short-stat1-does-not-use-default-rows {
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT sp.v FROM so JOIN sp ON sp.a = so.a WHERE sp.b = 7;
+}
+expect pattern {
+    (?s)"detail":"SEARCH sp USING INDEX sp_ab.*"rows_per_input":1,
+}

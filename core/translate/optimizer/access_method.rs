@@ -19,7 +19,9 @@ use crate::translate::optimizer::constraints::{
     partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
+use crate::translate::optimizer::cost::{
+    index_stat, rows_per_leaf_page_for_index, RowCountEstimate,
+};
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, JoinInfo, JoinOrigin,
@@ -742,9 +744,13 @@ pub(super) fn choose_best_in_seek_candidate(
             // reject the IN seek on them.
             let without_stats = !eq_prefix.is_empty()
                 && candidate.index.as_ref().is_some_and(|index| {
-                    analyze_stats
-                        .table_stats(rhs_table.namespace.id, rhs_table.table.get_name())
-                        .is_none_or(|ts| !ts.index_stats.contains_key(&index.name))
+                    index_stat(
+                        analyze_stats,
+                        rhs_table.namespace.id,
+                        rhs_table.table.get_name(),
+                        &index.name,
+                    )
+                    .is_none()
                 });
             let total_cost = in_cost + sort_penalty;
             let beats_best = if without_stats {
