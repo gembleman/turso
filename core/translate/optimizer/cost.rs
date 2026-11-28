@@ -426,6 +426,7 @@ const DEFAULT_ROWS_PER_INDEX_PREFIX: [f64; 6] = [
 /// default, and only a full unique key gives 1 row. The estimate is that
 /// default times the selectivity of any range constraint on the next column.
 /// It applies to real indexes only; an ephemeral index has no SQLite default to match.
+/// It does not apply to a null-matching (`IS`) equality, which can match many NULL keys.
 fn default_rows_for_join_probe_prefix(
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
@@ -433,6 +434,11 @@ fn default_rows_for_join_probe_prefix(
 ) -> Option<f64> {
     let first_eq = usable_constraint_refs.first()?.eq.as_ref()?;
     if !constraints[first_eq.constraint_pos].is_join_probe {
+        return None;
+    }
+    // SQLite's default rows say nothing about a key that can be NULL, and
+    // `estimate_rows_from_analyze_stats` declines it too.
+    if eq_prefix_has_null_matching(usable_constraint_refs) {
         return None;
     }
     let eq_prefix_len = usable_constraint_refs
@@ -576,6 +582,14 @@ fn join_probe_constant_selectivity(
         .product()
 }
 
+/// Whether an equality in the leading equality prefix is null-matching (`IS`).
+fn eq_prefix_has_null_matching(constraint_refs: &[RangeConstraintRef]) -> bool {
+    constraint_refs
+        .iter()
+        .map_while(|cref| cref.eq.as_ref())
+        .any(|eq| eq.null_matching)
+}
+
 /// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).
 /// Returns `None` when no actual stats exist for this index, signaling the
 /// caller to fall back to selectivity-based estimation.
@@ -600,10 +614,7 @@ fn estimate_rows_from_analyze_stats(
     // most of the table), so the average across all keys says nothing about
     // that bucket. Decline, so the caller falls back to the pessimistic
     // heuristic estimate for `IS`.
-    if constraint_refs[..eq_prefix_len]
-        .iter()
-        .any(|cref| cref.eq.as_ref().is_some_and(|eq| eq.null_matching))
-    {
+    if eq_prefix_has_null_matching(constraint_refs) {
         return None;
     }
 
@@ -693,7 +704,9 @@ pub fn estimate_cost_for_scan_or_seek(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::optimizer::constraints::BinaryExprSide;
     use crate::translate::optimizer::cost_params::DEFAULT_PARAMS;
+    use crate::translate::planner::TableMask;
 
     fn covering_index() -> IndexInfo {
         IndexInfo {
@@ -771,5 +784,59 @@ mod tests {
                 )
             );
         }
+    }
+
+    fn join_probe_equality(null_matching: bool) -> Constraint {
+        Constraint {
+            where_clause_pos: (0, BinaryExprSide::Rhs),
+            operator: ast::Operator::Equals.into(),
+            table_col_pos: Some(0),
+            expr: None,
+            constraining_expr: None,
+            lhs_mask: TableMask::default(),
+            is_join_probe: true,
+            selectivity: DEFAULT_PARAMS.sel_eq_indexed,
+            usable: true,
+            outer_join_compatible: true,
+            is_rowid: false,
+            comparison_affinity: None,
+            null_matching,
+            collation: None,
+        }
+    }
+
+    fn equality_ref(null_matching: bool) -> RangeConstraintRef {
+        RangeConstraintRef {
+            table_col_pos: Some(0),
+            index_col_pos: 0,
+            sort_order: ast::SortOrder::Asc,
+            nulls_order: ast::NullsOrder::First,
+            eq: Some(EqConstraintRef {
+                constraint_pos: 0,
+                null_matching,
+            }),
+            lower_bound: None,
+            upper_bound: None,
+        }
+    }
+
+    #[test]
+    fn join_probe_prefix_uses_sqlite_default_rows() {
+        let rows = default_rows_for_join_probe_prefix(
+            &[join_probe_equality(false)],
+            &[equality_ref(false)],
+            RowCountEstimate::HardcodedFallback(1_000_000.0),
+        );
+        assert_eq!(rows, Some(DEFAULT_ROWS_PER_FIRST_COLUMN_OF_INDEX));
+    }
+
+    #[test]
+    fn null_matching_join_probe_prefix_has_no_default_rows() {
+        let rows = default_rows_for_join_probe_prefix(
+            &[join_probe_equality(true)],
+            &[equality_ref(true)],
+            RowCountEstimate::HardcodedFallback(1_000_000.0),
+        );
+        assert_eq!(rows, None);
     }
 }
