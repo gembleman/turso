@@ -337,12 +337,14 @@ fn index_info_for_branch(
                 rhs_table,
                 rows_per_table_page,
             ),
+            ephemeral: index.ephemeral,
         }),
         None => Some(IndexInfo {
             unique: true,
             covering: true,
             column_count: 1,
             rows_per_leaf_page: rows_per_table_page,
+            ephemeral: false,
         }),
     }
 }

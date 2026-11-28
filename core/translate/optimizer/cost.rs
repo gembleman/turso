@@ -2,7 +2,7 @@ use crate::ast;
 use crate::schema::Index;
 use crate::stats::AnalyzeStats;
 use crate::sync::Arc;
-use crate::translate::expr::{WalkControl, walk_expr};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{EqConstraintRef, RangeConstraintRef};
 use crate::translate::plan::JoinedTable;
 
@@ -76,6 +76,10 @@ pub struct IndexInfo {
     /// Estimated rows per index leaf page, derived from the column count
     /// ratio between the index and its parent table.
     pub rows_per_leaf_page: f64,
+    /// Whether the index is built during the query (automatic index, materialized subquery).
+    /// Without stats its row estimate keeps the per-constraint selectivity, not SQLite's
+    /// default rows for a real index prefix.
+    pub ephemeral: bool,
 }
 
 /// Estimate rows per index leaf page based on the index/table width ratio.
@@ -278,12 +282,14 @@ pub(crate) fn index_access_is_unique_point_lookup(
             column_count: index.columns.len(),
             covering: false,
             rows_per_leaf_page: 0.0,
+            ephemeral: index.ephemeral,
         },
         None => IndexInfo {
             unique: true,
             column_count: 1,
             covering: false,
             rows_per_leaf_page: 0.0,
+            ephemeral: false,
         },
     };
     is_unique_point_lookup(index_info, usable_constraint_refs)
@@ -355,10 +361,12 @@ pub(crate) fn estimate_rows_per_seek(
         }
     }
 
-    if let Some(rows) =
-        default_rows_for_join_probe_prefix(constraints, usable_constraint_refs, base_row_count)
-    {
-        return rows;
+    if !index_info.ephemeral {
+        if let Some(rows) =
+            default_rows_for_join_probe_prefix(constraints, usable_constraint_refs, base_row_count)
+        {
+            return rows;
+        }
     }
 
     if let Some(rows) = default_rows_for_first_column_of_unique_key(
@@ -417,6 +425,7 @@ const DEFAULT_ROWS_PER_INDEX_PREFIX: [f64; 6] = [
 /// does not multiply: each extra equality column removes only one row from the
 /// default, and only a full unique key gives 1 row. The estimate is that
 /// default times the selectivity of any range constraint on the next column.
+/// It applies to real indexes only; an ephemeral index has no SQLite default to match.
 fn default_rows_for_join_probe_prefix(
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
@@ -692,6 +701,7 @@ mod tests {
             column_count: 2,
             covering: true,
             rows_per_leaf_page: 100.0,
+            ephemeral: false,
         }
     }
 

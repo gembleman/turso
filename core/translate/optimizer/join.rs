@@ -2269,12 +2269,14 @@ fn get_best_seek_score(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
+                ephemeral: index.ephemeral,
             },
             None => IndexInfo {
                 unique: true,
                 covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
+                ephemeral: false,
             },
         };
         let analyze_ctx = AnalyzeCtx {

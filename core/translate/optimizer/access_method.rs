@@ -302,6 +302,7 @@ pub(super) fn choose_best_btree_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
+                ephemeral: index.ephemeral,
             }),
             None if usable_constraint_refs.is_empty() => None,
             None => Some(IndexInfo {
@@ -309,6 +310,7 @@ pub(super) fn choose_best_btree_candidate(
                 covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
+                ephemeral: false,
             }),
         };
 
@@ -644,12 +646,14 @@ pub(super) fn choose_best_in_seek_candidate(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
+                ephemeral: index.ephemeral,
             },
             None => IndexInfo {
                 unique: true,
                 covering: false,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
+                ephemeral: false,
             },
         };
 
@@ -1046,12 +1050,14 @@ fn find_best_access_method_for_btree<'a>(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
+                ephemeral: index.ephemeral,
             },
             None => IndexInfo {
                 unique: true,
                 covering: true,
                 column_count: 1,
                 rows_per_leaf_page: params.rows_per_table_page,
+                ephemeral: false,
             },
         };
         let analyze_ctx = AnalyzeCtx {
@@ -1145,6 +1151,7 @@ fn find_best_access_method_for_btree<'a>(
                     rhs_table,
                     params.rows_per_table_page,
                 ),
+                ephemeral: true,
             };
             let rows_per_seek = estimate_rows_per_seek(
                 index_info,
@@ -2244,6 +2251,7 @@ fn find_best_access_method_for_subquery(
                     column_count: key_col_positions.len(),
                     covering: true,
                     rows_per_leaf_page: params.rows_per_table_page,
+                    ephemeral: true,
                 },
                 &rhs_constraints.constraints,
                 &usable_constraint_refs,
