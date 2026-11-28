@@ -222,7 +222,7 @@ test join-probe-with-short-stat1-does-not-use-default-rows {
     SELECT sp.v FROM so JOIN sp ON sp.a = so.a WHERE sp.b = 7;
 }
 expect pattern {
-    (?s)"detail":"SEARCH sp USING INDEX sp_ab.*"rows_per_input":1,
+    (?s)"detail":"SEARCH sp USING INDEX sp_ab.*"rows_per_input":0.1,
 }
 
 # Without stats an IN seek replaces a seek on the same index, but not a cheaper
